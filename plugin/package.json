@@ -1,0 +1,1 @@
+{"name":"enterprise-data-tools","version":"1.0.0","private":true,"type":"module","scripts":{"plugin:build":"openclaw plugins build --root .","plugin:validate":"openclaw plugins validate --root ."}}

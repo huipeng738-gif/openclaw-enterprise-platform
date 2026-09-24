@@ -1,0 +1,1 @@
+{"root":["./src/main.ts","./src/api/http.ts","./src/router/index.ts","./src/stores/auth.ts","./src/App.vue","./src/views/Agents.vue","./src/views/Audit.vue","./src/views/Chat.vue","./src/views/Dashboard.vue","./src/views/Knowledge.vue","./src/views/Login.vue","./src/views/Tasks.vue"],"version":"5.9.3"}

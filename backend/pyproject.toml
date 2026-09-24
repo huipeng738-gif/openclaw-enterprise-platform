@@ -1,0 +1,19 @@
+[project]
+name = "openclaw-enterprise-backend"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "redis>=5,<7",
+  "PyJWT>=2.9,<3",
+  "httpx>=0.28,<1",
+  "websockets>=14,<16",
+  "cryptography>=44,<47",
+]
+
+[dependency-groups]
+dev = ["fakeredis>=2.30,<3", "pytest>=8,<10"]
+
+[tool.uv]
+package = false

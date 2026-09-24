@@ -1,0 +1,43 @@
+# Linux / WSL2 host networking: the locally bound OpenClaw Gateway stays on 127.0.0.1:18789.
+services:
+  redis:
+    image: redis:7-alpine
+    network_mode: host
+    command: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes"]
+    volumes: ["redis_data:/data"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+  api:
+    build: ./backend
+    network_mode: host
+    env_file: .env
+    environment:
+      REDIS_URL: redis://127.0.0.1:6379/0
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    network_mode: host
+    env_file: .env
+    environment:
+      REDIS_URL: redis://127.0.0.1:6379/0
+      OPENCLAW_GATEWAY_URL: ws://127.0.0.1:18789
+      GATEWAY_IDENTITY_PATH: /data/gateway-device.pem
+    volumes: ["device_identity:/data"]
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    network_mode: host
+    depends_on: [api]
+    restart: unless-stopped
+volumes:
+  redis_data:
+  device_identity:

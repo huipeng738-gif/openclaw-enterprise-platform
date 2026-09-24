@@ -1,0 +1,15 @@
+{
+  "id": "enterprise-data-tools",
+  "name": "Enterprise Data Tools",
+  "version": "1.0.0",
+  "description": "Enterprise knowledge and metrics tools for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "knowledgeUrl": {"type": "string", "default": "http://127.0.0.1:8100/knowledge/search"},
+      "metricsUrl": {"type": "string", "default": "http://127.0.0.1:8100/metrics/query"},
+      "timeoutMs": {"type": "integer", "default": 15000}
+    },
+    "additionalProperties": false
+  }
+}
