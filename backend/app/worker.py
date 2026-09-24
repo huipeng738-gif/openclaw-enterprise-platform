@@ -19,6 +19,7 @@ IDENTITY = Path(os.getenv('GATEWAY_IDENTITY_PATH', '/data/gateway-device.pem'))
 TERMINAL = {'completed', 'failed', 'cancelled', 'timed_out'}
 
 async def emit(task_id, kind, **data):
+    # 事件写入任务专属 Redis Stream，WebSocket 可按游标有序读取。
     await r.xadd(f'events:{task_id}', {'data': json.dumps({'kind': kind, 'at': time.time(), **data}, ensure_ascii=False)}, maxlen=2000, approximate=True)
 
 async def update(task_id, **changes):
@@ -135,6 +136,7 @@ class Gateway:
             self.pending.pop(req_id, None)
 
 async def run(task_id):
+    # Worker 从队列取 task_id 后加载任务，调用 Gateway 并持续检查结果、取消和超时。
     task = json.loads(await r.get(f'task:{task_id}'))
     if await r.get(f'cancel:{task_id}'):
         await update(task_id, status='cancelled')
@@ -144,6 +146,7 @@ async def run(task_id):
     await update(task_id, status='running', sessionKey=session)
     try:
         async with Gateway(task_id) as gateway:
+            # Gateway 立即确认启动并返回 runId；执行过程由后续事件和 agent.wait 跟踪。
             accepted = await gateway.rpc('agent', {'message': task['prompt'], 'agentId': task['agent'], 'sessionKey': session, 'idempotencyKey': task_id, 'deliver': False})
             gateway.run_id = accepted['runId']
             for early in gateway.early:

@@ -177,6 +177,7 @@ async def enqueue(body, user):
     task = {'id': task_id, 'owner': user['username'], 'prompt': body.prompt, 'agent': body.agent,
             'timeoutSeconds': body.timeout_seconds, 'status': 'queued',
             'createdAt': datetime.now(timezone.utc).isoformat(), 'result': None, 'error': None}
+    # 保存任务与索引后入 Redis 队列；API 随即返回，Worker 在后台执行。
     await r.set(f'task:{task_id}', json.dumps(task, ensure_ascii=False))
     await r.sadd('tasks:all', task_id)
     await r.rpush('tasks:queue', task_id)
@@ -191,6 +192,7 @@ async def create_task(body: TaskCreate, user=Depends(permission('tasks:write')))
 
 @app.post('/api/chat', status_code=202)
 async def chat(body: TaskCreate, user=Depends(permission('tasks:write'))):
+    # 依赖链先校验 Bearer JWT 和 tasks:write 权限，通过后才创建任务。
     return await enqueue(body, user)
 
 
@@ -243,6 +245,7 @@ async def ws_ticket(task_id: str, user=Depends(permission('tasks:read'))):
 
 @app.websocket('/ws/tasks/{task_id}')
 async def ws_task(ws: WebSocket, task_id: str, ticket: str = ''):
+    # ws-ticket 有效期短且只允许使用一次，验证通过后才接受 WebSocket。
     ownership = await r.getdel(f'ws-ticket:{ticket}') if ticket else None
     if not ownership or ownership.split(':', 1)[-1] != task_id:
         await ws.close(code=1008)
@@ -255,6 +258,7 @@ async def ws_task(ws: WebSocket, task_id: str, ticket: str = ''):
             if not raw:
                 break
             task = json.loads(raw)
+            # 先发任务快照，再按 Redis Stream 游标推事件；终态快照带最终结果或错误。
             await ws.send_json({'type': 'snapshot', 'task': task})
             events = await r.xread({f'events:{task_id}': latest}, count=50, block=1000)
             for _, rows in events:
