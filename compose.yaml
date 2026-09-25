@@ -1,43 +1,130 @@
-# Linux / WSL2 host networking: the locally bound OpenClaw Gateway stays on 127.0.0.1:18789.
+name: openclaw-enterprise-platform
+
 services:
+
   redis:
     image: redis:7-alpine
-    network_mode: host
-    command: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes"]
-    volumes: ["redis_data:/data"]
+    container_name: openclaw-redis
+
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes"
+      ]
+
+    volumes:
+      - redis_data:/data
+
     restart: unless-stopped
+
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
+      timeout: 3s
+      retries: 10
+
+    networks:
+      - openclaw-net
+
+
   api:
-    build: ./backend
-    network_mode: host
-    env_file: .env
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    image: openclaw-enterprise-backend:latest
+    container_name: openclaw-api
+
+    command:
+      [
+        "uv",
+        "run",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8100"
+      ]
+
+    env_file:
+      - .env
+
     environment:
-      REDIS_URL: redis://127.0.0.1:6379/0
+      REDIS_URL: redis://redis:6379/0
+      OPENCLAW_GATEWAY_URL: ws://host.docker.internal:18789
+
     depends_on:
-      redis: {condition: service_healthy}
+      redis:
+        condition: service_healthy
+
     restart: unless-stopped
+
+    networks:
+      - openclaw-net
+
+
   worker:
-    build: ./backend
-    command: ["python", "-m", "app.worker"]
-    network_mode: host
-    env_file: .env
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    image: openclaw-enterprise-backend:latest
+    container_name: openclaw-worker
+
+    command:
+      [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "app.worker"
+      ]
+
+    env_file:
+      - .env
+
     environment:
-      REDIS_URL: redis://127.0.0.1:6379/0
-      OPENCLAW_GATEWAY_URL: ws://127.0.0.1:18789
-      GATEWAY_IDENTITY_PATH: /data/gateway-device.pem
-    volumes: ["device_identity:/data"]
+      REDIS_URL: redis://redis:6379/0
+      OPENCLAW_GATEWAY_URL: ws://host.docker.internal:18789
+
     depends_on:
-      redis: {condition: service_healthy}
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
     restart: unless-stopped
+
+    networks:
+      - openclaw-net
+
+
   web:
     build:
       context: .
       dockerfile: Dockerfile.web
-    network_mode: host
-    depends_on: [api]
+
+    image: openclaw-enterprise-web:latest
+    container_name: openclaw-web
+
+    ports:
+      - "80:80"
+
+    depends_on:
+      - api
+
     restart: unless-stopped
+
+    networks:
+      - openclaw-net
+
+
 volumes:
   redis_data:
-  device_identity:
+
+
+networks:
+  openclaw-net:
+    driver: bridge
