@@ -3,6 +3,7 @@ import { http } from '../api/http';
 const input = ref('');
 const messages = ref([]);
 const tools = ref([]);
+const sources = ref([]);
 const loading = ref(false);
 const error = ref('');
 let ws;
@@ -13,20 +14,33 @@ async function send() {
     input.value = '';
     messages.value.push({ role: 'user', text: q });
     tools.value = [];
+    sources.value = [];
     loading.value = true;
     error.value = '';
     try {
+        // 第一步：POST /api/chat 只创建后台任务，202 响应中含 task.id，不会等待 Agent 跑完。
         const task = (await http.post('/chat', { prompt: q })).data;
+        // 第二步：用短时、一次性的 ticket 换取 WebSocket 连接资格，避免把长期 JWT 放进 URL。
         const ticket = (await http.post(`/tasks/${task.id}/ws-ticket`)).data.ticket;
         const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        // 第三步：任务事件和最终状态通过 WebSocket 异步回传；HTTP 已经完成了“受理”响应。
         ws = new WebSocket(`${protocol}://${location.host}/ws/tasks/${task.id}?ticket=${encodeURIComponent(ticket)}`);
-        ws.onmessage = e => { const msg = JSON.parse(e.data); if (msg.type === 'event' && msg.event.kind === 'tool')
-            tools.value.push(msg.event); if (msg.type === 'snapshot' && ['completed', 'failed', 'cancelled', 'timed_out'].includes(msg.task.status)) {
-            messages.value.push({ role: 'assistant', text: msg.task.result || msg.task.error || msg.task.status });
+        ws.onmessage = e => {
+            const msg = JSON.parse(e.data);
+            // Worker 写入的 Tool 事件用于过程展示；终态 snapshot 携带结果或错误。
+            if (msg.type === 'event' && msg.event.kind === 'tool')
+                tools.value.push(msg.event);
+            if (msg.type === 'snapshot' && ['completed', 'failed', 'cancelled', 'timed_out'].includes(msg.task.status)) {
+                messages.value.push({ role: 'assistant', text: msg.task.result || msg.task.error || msg.task.status });
+                sources.value = msg.task.sources || [];
+                loading.value = false;
+                ws?.close();
+            }
+        };
+        ws.onerror = () => {
+            error.value = '实时连接中断，请在任务中心查看结果';
             loading.value = false;
-            ws?.close();
-        } };
-        ws.onerror = () => { error.value = '实时连接中断，请在任务中心查看结果'; loading.value = false; };
+        };
     }
     catch (e) {
         error.value = e.response?.data?.detail || '请求失败';
@@ -76,8 +90,33 @@ if (__VLS_ctx.tools.length) {
         });
         (t.name);
         (t.phase);
+        if (t.query) {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+            (t.query);
+        }
+        if (t.resultCount !== undefined) {
+            __VLS_asFunctionalElement1(__VLS_intrinsics.span, __VLS_intrinsics.span)({});
+            (t.resultCount);
+        }
         // @ts-ignore
         [tools, tools,];
+    }
+}
+if (__VLS_ctx.sources.length) {
+    __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+        ...{ class: "card" },
+    });
+    /** @type {__VLS_StyleScopedClasses['card']} */ ;
+    __VLS_asFunctionalElement1(__VLS_intrinsics.b, __VLS_intrinsics.b)({});
+    for (const [source, i] of __VLS_vFor((__VLS_ctx.sources))) {
+        __VLS_asFunctionalElement1(__VLS_intrinsics.div, __VLS_intrinsics.div)({
+            key: (`${source.document_id}-${i}`),
+        });
+        (i + 1);
+        (source.document_name);
+        (source.score?.toFixed(2));
+        // @ts-ignore
+        [sources, sources,];
     }
 }
 if (__VLS_ctx.error) {

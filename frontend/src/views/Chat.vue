@@ -5,6 +5,7 @@ import {http} from '../api/http'
 const input = ref('');
 const messages = ref<any[]>([]);
 const tools = ref<any[]>([]);
+const sources = ref<Array<{document_name: string; document_id: string; knowledge_base_id: string; score: number}>>([])
 const loading = ref(false);
 const error = ref('')
 let ws: WebSocket | undefined
@@ -15,6 +16,7 @@ async function send() {
   input.value = '';
   messages.value.push({role: 'user', text: q});
   tools.value = [];
+  sources.value = [];
   loading.value = true;
   error.value = ''
   try {
@@ -36,6 +38,7 @@ async function send() {
 
       if (msg.type === 'snapshot' && ['completed', 'failed', 'cancelled', 'timed_out'].includes(msg.task.status)) {
         messages.value.push({role: 'assistant', text: msg.task.result || msg.task.error || msg.task.status});
+        sources.value = msg.task.sources || []
         loading.value = false;
         ws?.close()
       }
@@ -57,7 +60,10 @@ onUnmounted(() => ws?.close())
     <div v-for="(m,i) in messages" :key="i" class="msg" :class="m.role"><span class="bubble">{{ m.text }}</span></div>
   </div>
   <div v-if="tools.length" class="card"><b>Tool 调用</b>
-    <div v-for="(t,i) in tools" :key="i">{{ t.name }} · {{ t.phase }}</div>
+    <div v-for="(t,i) in tools" :key="i">{{ t.name }} · {{ t.phase }}<span v-if="t.query"> · {{ t.query }}</span><span v-if="t.resultCount !== undefined"> · {{ t.resultCount }} 条</span></div>
+  </div>
+  <div v-if="sources.length" class="card"><b>引用来源</b>
+    <div v-for="(source,i) in sources" :key="`${source.document_id}-${i}`">[{{ i + 1 }}] {{ source.document_name }} · {{ source.score?.toFixed(2) }}</div>
   </div>
   <el-alert v-if="error" type="error" :title="error"/>
   <div class="toolbar">

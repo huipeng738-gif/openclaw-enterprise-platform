@@ -10,6 +10,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "websockets>=14,<16",
   "cryptography>=44,<47",
+  "python-multipart>=0.0.20,<1",
 ]
 
 [dependency-groups]

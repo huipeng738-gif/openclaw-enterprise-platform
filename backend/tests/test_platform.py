@@ -52,7 +52,7 @@ async def mock_gateway(socket):
     d = params['device']
     pub = base64.urlsafe_b64decode(d['publicKey'] + '==')
     assert hashlib.sha256(pub).hexdigest() == d['id']
-    signed = '|'.join(['v3', d['id'], 'gateway-client', 'operator', 'operator', ','.join(params['scopes']), str(d['signedAt']), 'test-gateway-token', d['nonce'], 'linux', ''])
+    signed = '|'.join(['v3', d['id'], params['client']['id'], params['client']['mode'], params['role'], ','.join(params['scopes']), str(d['signedAt']), 'test-gateway-token', d['nonce'], params['client']['platform'], ''])
     Ed25519PublicKey.from_public_bytes(pub).verify(base64.urlsafe_b64decode(d['signature'] + '=='), signed.encode())
     await socket.send(json.dumps({'type': 'res', 'id': 'connect', 'ok': True, 'payload': {'type': 'hello-ok'}}))
     while True:

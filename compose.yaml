@@ -53,14 +53,18 @@ services:
 
     environment:
       REDIS_URL: redis://redis:6379/0
-      OPENCLAW_GATEWAY_URL: ws://host.docker.internal:18789
+
+    ports:
+      - "127.0.0.1:8100:8100"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     depends_on:
       redis:
         condition: service_healthy
 
     restart: unless-stopped
-
     networks:
       - openclaw-net
 
@@ -87,7 +91,9 @@ services:
 
     environment:
       REDIS_URL: redis://redis:6379/0
-      OPENCLAW_GATEWAY_URL: ws://host.docker.internal:18789
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     depends_on:
       redis:

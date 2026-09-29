@@ -3,6 +3,9 @@
   "name": "Enterprise Data Tools",
   "version": "1.0.0",
   "description": "Enterprise knowledge and metrics tools for OpenClaw",
+  "activation": {"onStartup": true},
+  "contracts": {"tools": ["knowledge_search"]},
+  "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "properties": {

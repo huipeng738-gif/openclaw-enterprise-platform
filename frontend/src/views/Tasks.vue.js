@@ -6,38 +6,96 @@ const selected = ref(null);
 const events = ref([]);
 const error = ref('');
 let ws;
-async function load() { tasks.value = (await http.get('/tasks')).data; }
-async function watch(task) {
-    ws?.close();
-    selected.value = task;
-    events.value = (await http.get(`/tasks/${task.id}/events`)).data;
-    if (['completed', 'failed', 'cancelled', 'timed_out'].includes(task.status))
-        return;
-    const ticket = (await http.post(`/tasks/${task.id}/ws-ticket`)).data.ticket;
-    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${protocol}://${location.host}/ws/tasks/${task.id}?ticket=${encodeURIComponent(ticket)}`);
-    ws.onmessage = e => { const msg = JSON.parse(e.data); if (msg.type === 'snapshot') {
-        selected.value = msg.task;
-        const i = tasks.value.findIndex(t => t.id === msg.task.id);
-        if (i >= 0)
-            tasks.value[i] = msg.task;
+let watchVersion = 0;
+const terminal = ['completed', 'failed', 'cancelled', 'timed_out'];
+async function load() {
+    try {
+        tasks.value = (await http.get('/tasks')).data;
     }
-    else if (msg.type === 'event' && !events.value.some(x => x.id === msg.id))
-        events.value.push({ id: msg.id, ...msg.event }); };
-    ws.onerror = () => error.value = '实时连接中断，请重新点选任务';
+    catch (e) {
+        error.value = e.response?.data?.detail || '加载任务列表失败';
+    }
 }
-async function create() { error.value = ''; try {
-    const task = (await http.post('/tasks', { prompt: prompt.value })).data;
+async function watch(task) {
+    const version = ++watchVersion;
+    ws?.close();
+    ws = undefined;
+    error.value = '';
+    selected.value = task;
+    events.value = [];
+    try {
+        const history = (await http.get(`/tasks/${task.id}/events`)).data;
+        if (version !== watchVersion)
+            return;
+        events.value = history;
+        if (terminal.includes(task.status))
+            return;
+        const ticket = (await http.post(`/tasks/${task.id}/ws-ticket`)).data.ticket;
+        if (version !== watchVersion)
+            return;
+        const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        const socket = new WebSocket(`${protocol}://${location.host}/ws/tasks/${task.id}?ticket=${encodeURIComponent(ticket)}`);
+        ws = socket;
+        socket.onmessage = e => {
+            if (version !== watchVersion)
+                return;
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'snapshot') {
+                selected.value = msg.task;
+                const i = tasks.value.findIndex(t => t.id === msg.task.id);
+                if (i >= 0)
+                    tasks.value[i] = msg.task;
+            }
+            else if (msg.type === 'event' && !events.value.some(x => x.id === msg.id)) {
+                events.value.push({ id: msg.id, ...msg.event });
+            }
+        };
+        socket.onclose = () => {
+            if (version === watchVersion && !terminal.includes(selected.value?.status))
+                error.value = '实时连接中断，请重新点选任务';
+            if (ws === socket)
+                ws = undefined;
+        };
+    }
+    catch (e) {
+        if (version === watchVersion)
+            error.value = e.response?.data?.detail || '读取任务事件或建立实时连接失败';
+    }
+}
+async function create() {
+    error.value = '';
+    let task;
+    try {
+        task = (await http.post('/tasks', { prompt: prompt.value })).data;
+    }
+    catch (e) {
+        error.value = e.response?.data?.detail || '创建失败';
+        return;
+    }
     tasks.value.unshift(task);
     await watch(task);
 }
-catch (e) {
-    error.value = e.response?.data?.detail || '创建失败';
-} }
-async function cancel(task) { await http.post(`/tasks/${task.id}/cancel`); await load(); }
-async function retry(task) { const newer = (await http.post(`/tasks/${task.id}/retry`)).data; tasks.value.unshift(newer); await watch(newer); }
+async function cancel(task) {
+    try {
+        await http.post(`/tasks/${task.id}/cancel`);
+        await load();
+    }
+    catch (e) {
+        error.value = e.response?.data?.detail || '取消任务失败';
+    }
+}
+async function retry(task) {
+    try {
+        const newer = (await http.post(`/tasks/${task.id}/retry`)).data;
+        tasks.value.unshift(newer);
+        await watch(newer);
+    }
+    catch (e) {
+        error.value = e.response?.data?.detail || '重试任务失败';
+    }
+}
 onMounted(load);
-onUnmounted(() => ws?.close());
+onUnmounted(() => { watchVersion++; ws?.close(); });
 const __VLS_ctx = {
     ...{},
     ...{},

@@ -1,20 +1,18 @@
 <script setup lang="ts">
 import {ref} from 'vue'
 import {useRouter} from 'vue-router'
-import {http} from '../api/http'
-import {token, role} from '../stores/auth'
+import {pinia, useAuthStore} from '../stores/auth'
 
 const router = useRouter()
 const username = ref('');
 const password = ref('');
 const error = ref('')
 
+// 提交登录信息，保存返回的令牌和角色后进入工作台；失败时显示错误。
 async function login() {
   error.value = ''
   try {
-    const {data} = await http.post('/auth/login', {username: username.value, password: password.value});
-    token.value = data.access_token;
-    role.value = data.role;
+    await useAuthStore(pinia).login(username.value, password.value)
     router.push('/')
   } catch {
     error.value = '用户名或密码错误'

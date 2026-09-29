@@ -2,6 +2,7 @@ import asyncio
 import os
 from .main import password_hash, r
 
+# 从环境配置初始化管理员；账号已存在时保留原密码，结束后关闭 Redis 连接。
 async def main():
     username = os.environ['BOOTSTRAP_ADMIN_USER']
     password = os.environ['BOOTSTRAP_ADMIN_PASSWORD']

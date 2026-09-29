@@ -2,9 +2,9 @@
 
 Python 依赖由 `backend/pyproject.toml` 与 `backend/uv.lock` 管理，Ubuntu 本地开发与 Docker 镜像均使用 uv 锁定安装。
 
-本版本在上一版工程上加入 JWT 登录、RBAC、Redis 任务与事件持久化、真实 Gateway WebSocket 调用、Agent/Tool 事件展示、取消/超时/重试、操作审计及 Docker Compose。目标运行环境是 **Ubuntu / WSL2 内原生 Docker Engine，OpenClaw Gateway 已在同一 Ubuntu 实例启动**。
+本版本在上一版工程上加入 JWT 登录、RBAC、Redis 任务与事件持久化、真实 Gateway WebSocket 调用、Agent/Tool 事件展示、取消/超时/重试、操作审计及 Docker Compose。OpenClaw Gateway 和 RAGFlow 可以独立部署在云端；平台 Worker 通过配置的 WebSocket 地址访问 Gateway。
 
-> 真实接入的范围：worker 会完成 Gateway 设备认证握手，调用 `agent`、`agent.wait`、`chat.abort`，订阅 `agent` 事件；不会再返回伪造的回答或进度。`plugin/src/index.ts` 仍是上一版的占位文件，**必须替换为你原来的 enterprise-data-tools 源码**。知识库和指标服务的实际实现也未包含在原压缩包中，接口现在返回 501，等待合并你原来的业务代码。没有这些源码时，Agent 只能使用 Gateway 已配置的其他工具。
+> Worker 通过 Gateway 执行 Agent。知识库接入独立部署的 RAGFlow；指标接口仍返回 501，等待接入现有指标服务。
 
 ## 业务链路
 
@@ -34,7 +34,7 @@ flowchart TD
 
 ### 安装 Docker（仅你的 Ubuntu / WSL2 主机）
 
-本项目以 **同一个 Ubuntu / WSL2 实例中运行 Docker Engine 与 OpenClaw** 为前提，使用 `network_mode: host` 连 `127.0.0.1:18789`。若你现在使用 Windows Docker Desktop 的 WSL 集成，容器的 host 网络与 Ubuntu 进程的 loopback 未必是同一命名空间；请先确认两者互通，或改用下方本地开发方式。避免在同一个 WSL 发行版中同时安装 Docker Desktop 集成和原生 Docker Engine。
+本项目使用 Compose bridge 网络。Worker 从 `.env` 读取 `OPENCLAW_GATEWAY_URL`，云端 Gateway 需提供 Worker 可达的 `ws://` 或 `wss://` WebSocket 端点；`http://` 管理页面地址不能直接用于 Gateway 连接。
 
 Ubuntu 24.04/22.04 在 **同一 WSL Ubuntu 实例** 内，按 [Docker 官方 Ubuntu 安装说明](https://docs.docker.com/engine/install/ubuntu/) 配置仓库并安装（已经安装 Docker 的主机直接运行下面的版本检查即可）：
 
@@ -91,7 +91,7 @@ WSL 内需要启用 systemd 才能使用上述 `systemctl` 命令。安装只在
    sudo docker compose exec -e BOOTSTRAP_ADMIN_USER=admin -e BOOTSTRAP_ADMIN_PASSWORD='换成至少12位的强密码' api python -m app.bootstrap
    ```
 
-   访问 `http://127.0.0.1/`，用刚创建的管理员登录。Nginx 对外监听 80，FastAPI 只绑定 127.0.0.1:8100，Redis 只绑定 127.0.0.1:6379；Gateway 仍在 127.0.0.1:18789。本 Compose 使用 Linux host networking，以便 worker 访问宿主机仅监听 loopback 的 Gateway；不适合直接在 Docker Desktop 的非 Linux 网络语义下照搬。
+   访问 `http://127.0.0.1/`，用刚创建的管理员登录。Nginx 对外监听 80，FastAPI 仅通过宿主机 `127.0.0.1:8100` 提供插件接口，Redis 仅在 Compose 内部网络开放。确认 Worker 可以访问配置的云端 Gateway WebSocket。
 
 4. 首次 Gateway 设备配对：先在页面创建一条测试任务，然后查看：
 
@@ -102,7 +102,7 @@ WSL 内需要启用 systemd 才能使用上述 `systemctl` 命令。安装只在
 
    如果出现 `PAIRING_REQUIRED`，用 `openclaw devices approve <requestId>` 批准对应请求，再在页面点“重试”。worker 的设备私钥放在 `device_identity` Docker volume，重建容器时不要删除该卷。Gateway 协议与客户端需一起核对版本；这里按当前协议版本 4 实现，升级 OpenClaw 后应先做联调。
 
-5. 安装你已有的插件：先将真实插件源码合并到 `plugin/`，根据原插件实现将 `PLUGIN_SERVICE_TOKEN` 用作访问 FastAPI 内部工具接口的 `X-Plugin-Token`。在 Gateway 所在宿主机执行 `bash scripts/install_plugin.sh`。占位入口会阻止脚本执行。再合并原有的 RAG、指标查询代码到 `/knowledge/search` 与 `/metrics/query`，目前的 501 是有意提示未接入。
+5. 在 Gateway 所在宿主机执行 `bash scripts/install_plugin.sh` 安装 `knowledge_search` 插件。插件进程需要能读取与 API 相同的 `PLUGIN_SERVICE_TOKEN` 环境变量。云端 Gateway 应设置 `KNOWLEDGE_URL` 为从 Gateway 主机可达的 `https://<platform-host>/knowledge/search` 后再执行脚本；本地默认地址 `127.0.0.1:8100` 只适用于 Gateway 与 API 同机。指标接口仍返回 501。
 
 6. 执行自动验收：`sudo bash scripts/verify_docker.sh`。它会先执行 `docker compose config --quiet`，再检查 Vue 首页、FastAPI/Redis 健康状态、JWT 登录，创建一条真实 OpenClaw Agent 任务，等待完成并读取事件。脚本会交互式要求账号密码，失败时返回非零退出码；若 Gateway 要求设备配对，先完成第 4 步再重试。
 
@@ -110,24 +110,16 @@ WSL 内需要启用 systemd 才能使用上述 `systemctl` 命令。安装只在
 
 ## 二、Windows 启动应用，连接 WSL Ubuntu Docker
 
-**开发阶段：**Vue、FastAPI、Worker 在 Windows 的 PowerShell 运行；Redis 镜像由 WSL Ubuntu 内的原生 Docker Engine 管理；OpenClaw Gateway 运行在同一 WSL Ubuntu。**部署阶段：**关闭 Windows 的开发进程，再由 WSL Ubuntu Docker 运行 Redis、API、Worker、Nginx。两个 Compose 文件使用相同的项目名和 Redis 数据卷，切换时会重建 Redis 容器并保留其数据。
+**开发阶段：**Vue、FastAPI、Worker 可在 Windows PowerShell 运行；Redis 和 Gateway 需要单独启动并确认 Windows 可达。**部署阶段：**在 WSL Ubuntu 使用根目录 `compose.yaml` 启动平台。
 
-Windows 需要安装 Python 3.12、uv、Node 22+ 和 npm；Ubuntu 中需要 Docker Compose 与已启动的 Gateway。工程可解压在 `D:\agent_framework\openclaw-enterprise-platform`。在 WSL Ubuntu 终端启动 Redis（此命令仅在 Ubuntu 执行）：
-
-```bash
-cd /mnt/d/agent_framework/openclaw-enterprise-platform
-docker compose -f compose.windows.yaml up -d redis
-docker compose -f compose.windows.yaml ps
-```
-
-`compose.windows.yaml` 将 Redis 发布到 WSL 的 `127.0.0.1:6379`。在 Windows PowerShell 检查 WSL 的 localhost 转发，以及 Gateway 端口能否从 Windows 访问：
+Windows 需要安装 Python 3.12、uv、Node 22+ 和 npm；Ubuntu 部署需要 Docker Compose 与已启动的 Gateway。在 Windows PowerShell 检查 Redis 与 Gateway 是否可达：
 
 ```powershell
 Test-NetConnection 127.0.0.1 -Port 6379
 Test-NetConnection 127.0.0.1 -Port 18789
 ```
 
-两项都应显示 `TcpTestSucceeded : True`。如果 Redis 不通，先确认 WSL 中的 `docker compose -f compose.windows.yaml ps` 和 Windows/WSL localhost 转发；如果 Gateway 不通，先检查 WSL 内 `openclaw gateway status` 与 WSL 网络设置。不要为了调通连接把 Redis 或 Gateway 直接暴露到公网。
+两项都应显示 `TcpTestSucceeded : True`。如果服务不在 localhost，按实际地址设置 `REDIS_URL` 和 `OPENCLAW_GATEWAY_URL`。不要为了调通连接把 Redis 或 Gateway 直接暴露到公网。
 
 在 Windows PowerShell 进入工程，复制 `.env.example` 为 `.env`，填写 `JWT_SECRET`、`OPENCLAW_GATEWAY_TOKEN`、`PLUGIN_SERVICE_TOKEN` 等真实配置。默认 `REDIS_URL=redis://127.0.0.1:6379/0` 和 `OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789`，如使用其他转发端口可在 `.env` 中覆盖。依赖安装和管理员初始化在 Windows 执行：
 
@@ -152,12 +144,11 @@ Set-Location ..
 .\scripts\start_frontend_windows.ps1
 ```
 
-访问 `http://127.0.0.1:5173`，验证登录、创建真实任务、WebSocket 事件及取消/重试。Windows Worker 的设备身份保存在 `backend/.data/`；切到 Docker Worker 时会产生另一份设备身份，可能需要再次运行 `openclaw devices list` 并批准新的配对。插件源码与知识库/指标接口的现有占位限制见第一节。
+访问 `http://127.0.0.1:5173`，验证登录、创建任务、WebSocket 事件及取消/重试。Windows Worker 的设备身份保存在 `backend/.data/`；切到 Docker Worker 时会产生另一份设备身份，可能需要再次批准配对。
 
 本地验证完成后，停止三个 Windows 开发终端，确保 Windows 的 8100、5173 端口已释放。在 WSL Ubuntu 项目目录执行部署：
 
 ```bash
-docker compose -f compose.windows.yaml stop redis
 docker compose up -d --build
 docker compose ps
 ```
@@ -174,9 +165,12 @@ docker compose ps
 - `POST /api/tasks/{id}/ws-ticket`、`WS /ws/tasks/{id}?ticket=...`：一次性 30 秒票据，实时状态
 - `POST /api/tasks/{id}/cancel`、`POST /api/tasks/{id}/retry`：取消、重试
 - `GET /api/audit`：管理员审计记录
-- `POST /knowledge/search`、`POST /metrics/query`：内部插件接口，要求 `X-Plugin-Token`；原业务代码待合并
+- `GET/POST /api/knowledge/bases`、`GET/DELETE /api/knowledge/bases/{id}`：知识库管理
+- `GET/POST /api/knowledge/bases/{id}/documents`、文档状态、解析和删除接口：文档管理
+- `POST /api/knowledge/retrieval`：按 RBAC 检索并返回 Chunk、分数与来源
+- `POST /knowledge/search`：仅插件可用的检索接口，要求 `X-Plugin-Token`；`POST /metrics/query` 仍待接入指标服务
 
-任务状态为 `queued → running → completed/failed/cancelled/timed_out`。进度不显示虚构百分比。Tool 事件只保存名称、阶段、调用 ID，不转发工具参数与返回内容。任务结果来自 Gateway 的 assistant 事件；若该版本 Gateway 不提供文本，需对照 `chat.history` 适配结果提取。
+任务状态为 `queued → running → completed/failed/cancelled/timed_out`。进度不显示虚构百分比。普通 Tool 事件只保存名称、阶段和调用 ID；`knowledge_search` 额外保存有限长度的 query、结果数及真实文档来源，不转发完整工具输出。任务结果来自 Gateway 的 assistant 事件；若该版本 Gateway 不提供文本，需对照 `chat.history` 适配结果提取。
 
 ## 部署边界和注意事项
 
@@ -190,3 +184,29 @@ docker compose ps
 测试后端（可不启动 Docker）：`cd backend && uv sync --frozen && PYTHONPATH=. JWT_SECRET=testing-secret-of-at-least-32-bytes uv run --frozen pytest -q tests`。
 
 参考：[Gateway 外部应用接入](https://docs.openclaw.ai/gateway/external-apps)、[Gateway 协议](https://docs.openclaw.ai/gateway/protocol)、[客户端认证与 Tool Events](https://docs.openclaw.ai/gateway/clients)。
+
+## RAGFlow 知识库
+
+企业知识问答、文档草稿两个 OpenClaw Skill 已随企业插件提供。部署检查、调用示例与验收步骤见 [Skill 试点说明](plugin/SKILLS_README.md)；首期保持现有前端、任务 API 和 Worker 调用链。
+
+RAGFlow 作为本地或云端的独立服务运行。在其管理界面创建 API Key，并将以下值只写入本项目后端的 `.env`：
+
+```text
+RAGFLOW_BASE_URL=https://<your-ragflow-host>
+RAGFLOW_API_KEY=<ragflow-api-key>
+RAGFLOW_TIMEOUT_SECONDS=30
+```
+
+`RAGFLOW_BASE_URL` 必须从 API 容器或后端进程可达。`RAGFLOW_API_KEY` 不进入 Vue、Nginx 或插件配置。浏览器通过 Nginx 的 `/api/knowledge/` 路由访问 FastAPI，Nginx 现有 `/api/` 转发规则已覆盖这些路径。
+
+如果 RAGFlow 运行在 Windows 宿主机，而本平台运行在 Docker Desktop 容器中，`.env` 使用 `RAGFLOW_BASE_URL=http://host.docker.internal:8080`（端口按 RAGFlow 实际映射调整）；容器中的 `localhost` 指向容器自身。修改 `.env` 后执行 `docker compose up -d --force-recreate api worker` 使新配置生效。
+
+管理员登录后进入“知识库”，创建知识库或关联已有 RAGFlow 数据集，上传文档，点击“解析”，再刷新查看状态。状态由 RAGFlow 的 `run` 字段映射为 pending、parsing、completed、failed。检索测试可选择知识库、输入问题、调整返回条数和相似度阈值；结果直接显示 Chunk、分数和来源，不调用 LLM。管理员可删除文档和知识库，删除知识库会删除其 RAGFlow 数据。
+
+Agent 调用 `knowledge_search` 时，插件只向 FastAPI 内部 `POST /knowledge/search` 发检索请求，后端再调用 RAGFlow。插件从 Gateway 进程环境读取 `PLUGIN_SERVICE_TOKEN`，与 API 的值必须相同。为 Agent 配置工具策略时只允许 `knowledge_search`，不要授予管理类 API。Worker 保留 Gateway 的 Tool 事件；如果 Gateway 的 Tool 结果事件包含检索结果，任务快照会携带真实文档来源供聊天页展示。没有结果时来源列表为空。
+
+常见排查：503 表示后端未配置 RAGFlow；502/504 表示 RAGFlow 返回错误、不可达或超时；空知识库检索返回空结果，需先上传并解析文档；RAGFlow Cloud 若提示 API Key 需要 Starter/Pro 套餐，需在云端解决账号权限后再验收；平台返回 403 表示 RBAC 不允许当前操作。插件报未配置时检查 Gateway 进程的 `PLUGIN_SERVICE_TOKEN` 和 `knowledgeUrl`。云端插件要能通过 HTTPS 访问平台 `/knowledge/search`；本项目 Nginx 提供该路由，但当前 Compose 只监听 HTTP，跨互联网部署需配置 TLS 入口。不要在日志中打印 API Key。
+
+本地验证命令：`cd backend && uv run python -m pytest -q && uv run python -m compileall app`，`cd frontend && npm run build`，以及在配置好 `.env` 后运行 `docker compose config --quiet`。真实 RAGFlow 与 Gateway 的端到端验收需要使用目标部署环境执行。
+
+完整知识库任务验收：在项目根目录运行 `uv run --project backend python scripts/verify_knowledge.py --query "你的知识库问题"`。脚本要求账号具有创建任务的权限；默认交互输入账号密码，也可以从已忽略提交的 `.env` 读取 `VERIFY_USERNAME` 和 `VERIFY_PASSWORD`，验证后移除这两项。它通过 Nginx 登录并提交聊天任务，验证真实 Worker 的 Tool 开始/结果事件、WebSocket 终态回答、文档来源和事件回放；不会打印密码、JWT、WebSocket ticket 或文档正文。
