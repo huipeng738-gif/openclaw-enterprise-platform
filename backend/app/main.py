@@ -8,13 +8,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import jwt
+from pymysql.err import IntegrityError
 import redis.asyncio as redis
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .clients.ragflow import RagflowClient, RagflowError
+from .clients.business_db import BusinessDatabase, BusinessDatabaseError, BusinessDatabaseTimeout
 from .routers.knowledge import build_knowledge_router
+from .routers.business import build_business_router
+from .routers.metrics import build_metrics_router
+from .routers.actions import build_action_router
+from .services.observability import summarize as summarize_observability
+from .services.runtime import gateway_status
+from .services.settings import admit_task, dependency_status, task_policy, update_task_policy
+from .services.users import UserStore, migrate_legacy_users
+from .services.agents import agent_roster, available_models, create_agent, enabled_ids, set_agent_enabled
 
 SECRET = os.getenv('JWT_SECRET', '')
 if len(SECRET) < 32:
@@ -28,22 +38,32 @@ REFRESH_COOKIE_PATH = '/api/auth'
 if ACCESS_TOKEN_EXPIRE_MINUTES <= 0 or REFRESH_TOKEN_EXPIRE_DAYS <= 0:
     raise RuntimeError('Token lifetimes must be positive')
 ROLES = {'viewer': {'tasks:read', 'agents:read'},
-         'operator': {'tasks:read', 'tasks:write', 'agents:read', 'knowledge:read', 'knowledge:retrieve'},
-         'admin': {'tasks:read', 'tasks:write', 'agents:read', 'knowledge:read', 'knowledge:write',
-                   'knowledge:delete', 'knowledge:retrieve', 'audit:read', 'users:write'}}
+         'operator': {'tasks:read', 'tasks:write', 'agents:read', 'knowledge:read', 'knowledge:retrieve',
+                      'business:read'},
+         'admin': {'tasks:read', 'tasks:write', 'agents:read', 'agents:write', 'knowledge:read', 'knowledge:write',
+                   'knowledge:delete', 'knowledge:retrieve', 'business:read', 'audit:read', 'users:write'}}
 TERMINAL = {'completed', 'failed', 'cancelled', 'timed_out'}
 
 
-# 启动时检查 Redis 并创建 RAGFlow 客户端，退出时释放连接。
+# 启动时检查 Redis 与业务 MySQL，创建 RAGFlow 客户端，退出时释放连接。
 @asynccontextmanager
 async def lifespan(app):
     await r.ping()
+    app.state.business_db = await BusinessDatabase.from_env()
+    if getattr(app.state, 'users', None) is None:
+        if app.state.business_db is None:
+            raise RuntimeError('MySQL account store is required')
+        app.state.users = UserStore(app.state.business_db.pool)
+        await app.state.users.ensure_schema()
+        await migrate_legacy_users(r, app.state.users)
     app.state.ragflow = RagflowClient.from_env()
     try:
         yield
     finally:
         if app.state.ragflow:
             await app.state.ragflow.close()
+        if app.state.business_db:
+            await app.state.business_db.close()
         await r.aclose()
 
 
@@ -56,6 +76,13 @@ async def ragflow_error_handler(_request, exc: RagflowError):
     return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
 
 
+# 将业务数据库超时和连接异常映射为不暴露 SQL 及凭证的响应。
+@app.exception_handler(BusinessDatabaseError)
+async def business_error_handler(_request, exc: BusinessDatabaseError):
+    code = 504 if isinstance(exc, BusinessDatabaseTimeout) else 503
+    return JSONResponse(status_code=code, content={'detail': str(exc)})
+
+
 class Login(BaseModel):
     username: str
     password: str
@@ -65,15 +92,40 @@ class UserCreate(Login):
     role: str
 
 
+class UserRoleChange(BaseModel):
+    role: str
+
+
+class UserAvailability(BaseModel):
+    disabled: bool
+
+
+class UserPasswordReset(BaseModel):
+    password: str
+
+
+class TaskPolicyChange(BaseModel):
+    version: int = Field(ge=0)
+    defaultTimeoutSeconds: int = Field(ge=10, le=1800)
+    submissionsPaused: bool
+
+
 class TaskCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     agent: str = Field(default='coordinator', pattern=r'^[a-zA-Z0-9_-]{1,48}$')
-    timeout_seconds: int = Field(default=180, ge=10, le=1800)
+    timeout_seconds: int | None = Field(default=None, ge=10, le=1800)
 
 
-class Metric(BaseModel):
-    metric: str = Field(min_length=1, max_length=120)
-    period: str = '7d'
+class AgentCreate(BaseModel):
+    id: str = Field(pattern=r'^[a-z][a-z0-9_-]{1,47}$')
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default='', max_length=500)
+    model: str = Field(min_length=3, max_length=160)
+    tool_policy: str = Field(default='minimal', pattern=r'^(minimal|business_readonly)$')
+
+
+class DatabaseQuestion(BaseModel):
+    prompt: str = Field(min_length=1, max_length=1000)
 
 
 # 使用随机盐和 PBKDF2 生成密码摘要，返回盐与摘要的组合。
@@ -106,9 +158,11 @@ async def identity(token):
                        options={'require': ['sub', 'type', 'exp']})
         if p.get('type') != 'access':
             raise ValueError('access token required')
-        user = await r.hgetall(f'user:{p["sub"]}')
-        if user.get('role') not in ROLES or user.get('disabled') == '1':
+        user = await app.state.users.get(p['sub'])
+        if not user or user['role'] not in ROLES or user['disabled']:
             raise ValueError('inactive')
+        if p.get('sessionVersion', 0) != user['session_version']:
+            raise ValueError('session revoked')
         return {'username': p['sub'], 'role': user['role']}
     except (jwt.PyJWTError, ValueError, KeyError):
         raise HTTPException(401, 'invalid credentials')
@@ -150,6 +204,12 @@ async def health():
     return {'status': 'ok'}
 
 
+# 返回 Worker 最近一次只读 Gateway 握手的状态，过期或未上报时保持未知。
+@app.get('/api/runtime/gateway')
+async def runtime_gateway(user=Depends(permission('tasks:read'))):
+    return await gateway_status(r)
+
+
 @app.post('/api/auth/login')
 async def login(body: Login, request: Request, response: Response):
     cookie_origin_guard(request)
@@ -160,8 +220,8 @@ async def login(body: Login, request: Request, response: Response):
         await r.expire(f'login-attempts:{body.username[:80]}', 60)
     if attempts > 10:
         raise HTTPException(429, 'too many login attempts; try again later')
-    user = await r.hgetall(f'user:{body.username}')
-    if not user or not password_valid(body.password, user.get('password', '')) or user.get('disabled') == '1':
+    user = await request.app.state.users.get(body.username)
+    if not user or not password_valid(body.password, user['password_hash']) or user['disabled']:
         await audit(body.username[:80], 'auth.login', '-', 'denied')
         raise HTTPException(401, 'invalid credentials')
     await audit(body.username, 'auth.login', '-')
@@ -173,7 +233,8 @@ async def login(body: Login, request: Request, response: Response):
         'username': body.username, 'created_at': now.isoformat(), 'expires_at': expires.isoformat()
     }), ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400)
     refresh_token = jwt.encode({'sub': body.username, 'iss': 'enterprise-bff', 'type': 'refresh',
-                               'jti': jti, 'iat': now, 'exp': expires}, SECRET, algorithm='HS256')
+                               'jti': jti, 'sessionVersion': user['session_version'],
+                               'iat': now, 'exp': expires}, SECRET, algorithm='HS256')
     # Re-login replaces the current browser session rather than leaving it usable.
     old = refresh_claims(request.cookies.get(REFRESH_COOKIE, ''))
     if old:
@@ -181,7 +242,7 @@ async def login(body: Login, request: Request, response: Response):
     response.set_cookie(REFRESH_COOKIE, refresh_token, httponly=True, secure=REFRESH_COOKIE_SECURE,
                         samesite='lax', path=REFRESH_COOKIE_PATH,
                         max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, expires=expires)
-    return access_response(body.username, user['role'])
+    return access_response(body.username, user['role'], user['session_version'])
 
 
 def cookie_origin_guard(request: Request):
@@ -205,9 +266,10 @@ def refresh_claims(token: str):
         return None
 
 
-def access_response(username: str, role: str):
+def access_response(username: str, role: str, session_version: int = 0):
     now = datetime.now(timezone.utc)
     token = jwt.encode({'sub': username, 'iss': 'enterprise-bff', 'type': 'access', 'iat': now,
+                        'sessionVersion': session_version,
                         'exp': now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)},
                        SECRET, algorithm='HS256')
     return {'access_token': token, 'token_type': 'bearer', 'role': role,
@@ -224,10 +286,12 @@ async def refresh(request: Request, response: Response):
     raw = await r.get(f'auth:refresh:{claims["jti"]}')
     if not raw or json.loads(raw)['username'] != claims['sub']:
         raise HTTPException(401, 'invalid refresh session')
-    user = await r.hgetall(f'user:{claims["sub"]}')
-    if user.get('role') not in ROLES or user.get('disabled') == '1':
+    user = await request.app.state.users.get(claims['sub'])
+    if not user or user['role'] not in ROLES or user['disabled']:
         raise HTTPException(401, 'inactive account')
-    return access_response(claims['sub'], user['role'])
+    if claims.get('sessionVersion', 0) != user['session_version']:
+        raise HTTPException(401, 'invalid refresh session')
+    return access_response(claims['sub'], user['role'], user['session_version'])
 
 
 @app.post('/api/auth/logout')
@@ -251,20 +315,116 @@ async def me(user=Depends(current)):
 # 校验新用户信息，避免覆盖已有密码，并记录创建审计。
 @app.post('/api/users', status_code=201)
 async def add_user(body: UserCreate, user=Depends(permission('users:write'))):
-    if body.role not in ROLES or len(body.password) < 12 or not body.username.isidentifier():
+    if body.role not in ROLES or len(body.password) < 12 or not body.username.isidentifier() or len(body.username) > 80:
         raise HTTPException(400, 'invalid username, role or password')
-    if not await r.hsetnx(f'user:{body.username}', 'password', password_hash(body.password)):
+    try:
+        await app.state.users.create(body.username, password_hash(body.password), body.role)
+    except IntegrityError:
         raise HTTPException(409, 'user exists')
-    await r.hset(f'user:{body.username}', mapping={'role': body.role, 'disabled': '0'})
     await audit(user['username'], 'user.create', body.username)
     return {'username': body.username, 'role': body.role}
 
 
-# 返回配置中允许使用的 Agent 列表。
+# 扫描账号 Hash 并只返回非敏感字段；不公开密码摘要或会话版本。
+@app.get('/api/users')
+async def list_users(user=Depends(permission('users:write'))):
+    return await app.state.users.list()
+
+
+# MySQL 事务统一保护账号变更及最后一个可用管理员。
+async def change_user(username, **fields):
+    updated = await app.state.users.change(username, **fields)
+    if updated is None:
+        raise HTTPException(404, 'user not found')
+    if updated is False:
+        raise HTTPException(409, 'last active admin must remain enabled')
+    return updated
+
+
+# 修改账号角色，当前权限从 Redis 即时生效并撤销旧会话。
+@app.put('/api/users/{username}/role')
+async def set_user_role(username: str, body: UserRoleChange, user=Depends(permission('users:write'))):
+    if body.role not in ROLES:
+        raise HTTPException(400, 'invalid role')
+    updated = await change_user(username, role=body.role)
+    await audit(user['username'], 'user.role', username)
+    return updated
+
+
+# 启停账号，停用后旧会话不可在恢复时重新使用。
+@app.put('/api/users/{username}/availability')
+async def set_user_availability(username: str, body: UserAvailability,
+                                user=Depends(permission('users:write'))):
+    updated = await change_user(username, disabled=body.disabled)
+    await audit(user['username'], 'user.disable' if body.disabled else 'user.enable', username)
+    return updated
+
+
+# 重置密码并递增会话版本，所有旧 Access/Refresh Token 立即失效。
+@app.put('/api/users/{username}/password')
+async def reset_user_password(username: str, body: UserPasswordReset,
+                              user=Depends(permission('users:write'))):
+    if len(body.password) < 12:
+        raise HTTPException(400, 'password must be at least 12 characters')
+    await change_user(username, password_hash=password_hash(body.password))
+    await audit(user['username'], 'user.password_reset', username)
+    return {'username': username, 'reset': True}
+
+
+# 读取持久化任务策略，供管理员看到实际生效值和版本。
+@app.get('/api/settings/task-policy')
+async def get_task_policy(user=Depends(permission('users:write'))):
+    return await task_policy(r)
+
+
+# 按版本保存超时与暂停开关，避免管理员并发覆盖。
+@app.put('/api/settings/task-policy')
+async def set_task_policy(body: TaskPolicyChange, user=Depends(permission('users:write'))):
+    updated = await update_task_policy(r, body.version, body.defaultTimeoutSeconds, body.submissionsPaused)
+    if updated is None:
+        raise HTTPException(409, 'task policy changed; reload and retry')
+    await audit(user['username'], 'settings.task_policy', f'version:{updated["version"]}')
+    return updated
+
+
+# 实际探测可访问依赖并返回最小诊断信息。
+@app.get('/api/settings/dependencies')
+async def get_dependencies(request: Request, user=Depends(permission('users:write'))):
+    return await dependency_status(r, request.app.state.business_db, request.app.state.ragflow)
+
+
+# 返回 Gateway 中确实存在且平台启用的 Agent，保留原有 id/name 字段。
 @app.get('/api/agents')
 async def agents(user=Depends(permission('agents:read'))):
-    return [{'id': a, 'name': a} for a in
-            os.getenv('ALLOWED_AGENTS', 'coordinator,researcher,writer,reviewer').split(',')]
+    return await agent_roster(r)
+
+
+# 展示 Gateway 中全部普通 Agent 的真实配置及近 30 天平台任务统计。
+@app.get('/api/agents/manage')
+async def manage_agents(user=Depends(permission('agents:read'))):
+    return await agent_roster(r, include_unavailable=True)
+
+
+# 返回当前 Gateway 可选模型，供新增 Agent 表单选择。
+@app.get('/api/agents/models')
+async def agent_models(user=Depends(permission('agents:write'))):
+    return await available_models()
+
+
+# 创建真实 Gateway Agent，设置 Tool 策略后登记平台元数据并写审计。
+@app.post('/api/agents', status_code=201)
+async def add_agent(body: AgentCreate, user=Depends(permission('agents:write'))):
+    agent_id = await create_agent(r, body)
+    await audit(user['username'], 'agent.create', agent_id)
+    return {'id': agent_id}
+
+
+# 管理员切换 Agent 在平台聊天任务中的可用性，不删除 Gateway 配置。
+@app.post('/api/agents/{agent_id}/availability')
+async def agent_availability(agent_id: str, enabled: bool, user=Depends(permission('agents:write'))):
+    await set_agent_enabled(r, agent_id, enabled)
+    await audit(user['username'], 'agent.enable' if enabled else 'agent.disable', agent_id)
+    return {'id': agent_id, 'enabled': enabled}
 
 
 # 统计当前用户可见任务的运行与完成数量，并返回 Agent 数量。
@@ -272,22 +432,43 @@ async def agents(user=Depends(permission('agents:read'))):
 async def dashboard(user=Depends(permission('tasks:read'))):
     tasks = [json.loads(v) for k in await r.smembers('tasks:all') if (v := await r.get(f'task:{k}'))]
     visible = [t for t in tasks if user['role'] == 'admin' or t['owner'] == user['username']]
-    return {'agentCount': len(os.getenv('ALLOWED_AGENTS', 'coordinator,researcher,writer,reviewer').split(',')),
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    terminal = [t for t in visible if t['status'] in TERMINAL]
+    completed = sum(t['status'] == 'completed' for t in terminal)
+    recent = sorted(visible, key=lambda t: t.get('createdAt', ''), reverse=True)
+    def summary(task):
+        return {key: task.get(key) for key in ('id', 'prompt', 'agent', 'status', 'createdAt', 'latencyMs')}
+    observability = await summarize_observability(r, recent)
+    trend = []
+    for days_ago in range(6, -1, -1):
+        day = (now - timedelta(days=days_ago)).date().isoformat()
+        trend.append({'date': day, 'count': sum(t.get('createdAt', '').startswith(day) for t in visible)})
+    return {'agentCount': len(await enabled_ids(r)),
             'runningTasks': sum(t['status'] == 'running' for t in visible),
-            'completedTasks': sum(t['status'] == 'completed' for t in visible)}
+            'completedTasks': completed,
+            'todayTasks': sum(t.get('createdAt', '').startswith(today) for t in visible),
+            'successRate': round(completed / len(terminal) * 100, 1) if terminal else None,
+            'taskTrend': trend,
+            'recentTasks': [summary(t) for t in recent[:5]],
+            'failedTasks': [summary(t) for t in recent if t['status'] in {'failed', 'timed_out'}][:5],
+            'observability': observability, 'gateway': await gateway_status(r)}
 
 
-async def enqueue(body, user):
-    if body.agent not in os.getenv('ALLOWED_AGENTS', 'coordinator,researcher,writer,reviewer').split(','):
+async def enqueue(body, user, kind='chat'):
+    if kind != 'database' and body.agent not in await enabled_ids(r):
         raise HTTPException(400, 'agent not allowed')
     task_id = uuid.uuid4().hex
-    task = {'id': task_id, 'owner': user['username'], 'prompt': body.prompt, 'agent': body.agent,
-            'timeoutSeconds': body.timeout_seconds, 'status': 'queued',
-            'createdAt': datetime.now(timezone.utc).isoformat(), 'result': None, 'error': None}
-    # 保存任务与索引后入 Redis 队列；API 随即返回，Worker 在后台执行。
-    await r.set(f'task:{task_id}', json.dumps(task, ensure_ascii=False))
-    await r.sadd('tasks:all', task_id)
-    await r.rpush('tasks:queue', task_id)
+    # 任务策略与入队使用 WATCH/MULTI 建立顺序；Worker 使用快照中的有效超时。
+    def task_factory(policy):
+        return {'id': task_id, 'owner': user['username'], 'prompt': body.prompt, 'agent': body.agent,
+                'kind': kind, 'timeoutSeconds': body.timeout_seconds or policy['defaultTimeoutSeconds'],
+                'status': 'queued', 'createdAt': datetime.now(timezone.utc).isoformat(),
+                'result': None, 'error': None, 'traceId': uuid.uuid4().hex,
+                'threadId': None, 'model': None, 'tokenUsage': None}
+    task = await admit_task(r, task_id, task_factory)
+    if task is None:
+        raise HTTPException(503, 'new task submissions are paused')
     await audit(user['username'], 'task.create', task_id)
     return task
 
@@ -302,6 +483,14 @@ async def create_task(body: TaskCreate, user=Depends(permission('tasks:write')))
 async def chat(body: TaskCreate, user=Depends(permission('tasks:write'))):
     # 依赖链先校验 Bearer JWT 和 tasks:write 权限，通过后才创建任务。
     return await enqueue(body, user)
+
+
+# 受理开放式数据库分析问题，继续使用现有任务队列和状态接口。
+@app.post('/api/database/questions', status_code=202)
+async def database_question(body: DatabaseQuestion, user=Depends(permission('business:read'))):
+    task = await enqueue(TaskCreate(prompt=body.prompt, agent='database'), user, kind='database')
+    await audit(user['username'], 'database.question', task['id'])
+    return task
 
 
 # 按创建时间倒序返回当前用户可见的最近一百个任务。
@@ -320,9 +509,11 @@ async def get_task(task_id: str, user=Depends(permission('tasks:read'))):
 
 # 校验任务访问权限后读取最多两百条历史事件。
 @app.get('/api/tasks/{task_id}/events')
-async def task_events(task_id: str, user=Depends(permission('tasks:read'))):
+async def task_events(task_id: str, after: str = Query('0-0', pattern=r'^\d+-\d+$'),
+                      limit: int = Query(200, ge=1, le=200), user=Depends(permission('tasks:read'))):
     await task_for(task_id, user)
-    return [{'id': key, **json.loads(fields['data'])} for key, fields in await r.xrange(f'events:{task_id}', count=200)]
+    return [{'id': key, **json.loads(fields['data'])} for key, fields in
+            await r.xrange(f'events:{task_id}', min=f'({after}', count=limit)]
 
 
 # 为未结束任务设置一小时有效的取消标记，交由 Worker 处理并记录审计。
@@ -342,8 +533,9 @@ async def retry(task_id: str, user=Depends(permission('tasks:write'))):
     old = await task_for(task_id, user)
     if old['status'] not in {'failed', 'cancelled', 'timed_out'}:
         raise HTTPException(409, 'only unsuccessful terminal tasks can be retried')
+    kind = old.get('kind', 'chat')
     new = await enqueue(TaskCreate(prompt=old['prompt'], agent=old['agent'], timeout_seconds=old['timeoutSeconds']),
-                        user)
+                        user, kind=kind)
     await audit(user['username'], 'task.retry', f'{task_id}->{new["id"]}')
     return new
 
@@ -358,7 +550,8 @@ async def ws_ticket(task_id: str, user=Depends(permission('tasks:read'))):
 
 
 @app.websocket('/ws/tasks/{task_id}')
-async def ws_task(ws: WebSocket, task_id: str, ticket: str = ''):
+async def ws_task(ws: WebSocket, task_id: str, ticket: str = '',
+                  after: str = Query('0-0', pattern=r'^\d+-\d+$')):
     # ws-ticket 有效期短且只允许使用一次，验证通过后才接受 WebSocket。
     ownership = await r.getdel(f'ws-ticket:{ticket}') if ticket else None
     if not ownership or ownership.split(':', 1)[-1] != task_id:
@@ -366,7 +559,7 @@ async def ws_task(ws: WebSocket, task_id: str, ticket: str = ''):
         return
     await ws.accept()
     try:
-        latest = '0-0'
+        latest = after
         while True:
             raw = await r.get(f'task:{task_id}')
             if not raw:
@@ -374,12 +567,19 @@ async def ws_task(ws: WebSocket, task_id: str, ticket: str = ''):
             task = json.loads(raw)
             # 先发任务快照，再按 Redis Stream 游标推事件；终态快照带最终结果或错误。
             await ws.send_json({'type': 'snapshot', 'task': task})
-            events = await r.xread({f'events:{task_id}': latest}, count=50, block=1000)
+            # 终态任务也须排空回放事件，避免首批 50 条之后的 Tool/文本丢失。
+            if task['status'] in TERMINAL:
+                rows = await r.xrange(f'events:{task_id}', min=f'({latest}', count=50)
+                events = [(f'events:{task_id}', rows)]
+            else:
+                events = await r.xread({f'events:{task_id}': latest}, count=50, block=1000)
+            batch_size = 0
             for _, rows in events:
+                batch_size += len(rows)
                 for event_id, fields in rows:
                     latest = event_id
                     await ws.send_json({'type': 'event', 'id': event_id, 'event': json.loads(fields['data'])})
-            if task['status'] in TERMINAL:
+            if task['status'] in TERMINAL and batch_size < 50:
                 break
     except WebSocketDisconnect:
         pass
@@ -403,10 +603,7 @@ def plugin_guard(token: str = Header(default='', alias='X-Plugin-Token')):
         raise HTTPException(401, 'plugin credential required')
 
 
-# 保留指标查询入口；实际指标服务尚未接入，返回 501。
-@app.post('/metrics/query')
-async def metrics(body: Metric, _=Depends(plugin_guard)):
-    raise HTTPException(501, 'connect existing metrics service')
-
-
 app.include_router(build_knowledge_router(permission, plugin_guard, audit, lambda: r))
+app.include_router(build_action_router(permission, plugin_guard, audit, lambda: r, lambda: app.state.users))
+app.include_router(build_business_router(permission, plugin_guard, audit))
+app.include_router(build_metrics_router(permission, plugin_guard, audit))

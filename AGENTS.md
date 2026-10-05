@@ -372,3 +372,169 @@ Redis Task Schema 修改时要同时检查：
 - 解释调用链时优先使用：
   `前端 -> FastAPI -> Redis -> Worker -> OpenClaw -> WebSocket -> 前端`
 - 如果回答较长，先给摘要；只有用户要求时再展开详细解释
+
+## Docker 验证规则
+
+本项目以 Docker Compose 作为主要运行与验收环境。
+
+启动任务时：
+
+1. 执行 `docker compose config`。
+2. 执行 `docker compose ps` 检查现有服务。
+3. 如果服务尚未启动，执行：
+   `docker compose up -d --build`
+4. 如果服务已经正常运行，不要无意义地重复完整构建。
+
+开发过程中：
+
+- 修改 backend 后：
+  `docker compose build api worker`
+  `docker compose up -d api worker`
+
+- 修改 frontend 后：
+  `docker compose build web`
+  `docker compose up -d web`
+
+- 修改 compose.yaml / Dockerfile / 依赖文件后：
+  `docker compose build`
+  `docker compose up -d`
+
+每个 Phase 完成后必须验证：
+
+- `docker compose ps`
+- Redis healthy
+- `redis-cli ping` 返回 PONG
+- API → Redis 正常
+- Worker → Redis 正常
+- GET /health 返回 200
+- 受影响服务 logs 无启动错误
+- backend/frontend 对应测试通过
+
+Docker 验证失败时：
+修复 → 重新 build → up → test。
+
+Engineering Gate 全部 PASS 后才能进入下一 Phase。
+
+阶段验收分为两个独立门禁：
+
+- Engineering Gate：build、frontend/backend tests、Docker、Redis、health check 全部通过时标记 PASS。
+- Browser Acceptance：浏览器不可用时，登录、刷新、退出、RBAC、页面交互和视觉检查标记 BLOCKED_BY_ENVIRONMENT，不得伪造 PASS；这不阻塞 Engineering Gate PASS 后继续下一 Phase。
+- 浏览器恢复后必须补做所有未完成的 Browser Acceptance，并更新 `design/design-2-progress.md`。
+- 优先使用已有或低成本增加的 Playwright E2E 验证登录、刷新、退出、路由和 RBAC；能自动验证的项目不得跳过。
+- HTTP 200 不能证明 UI 或视觉验收通过；自动交互测试和视觉验收分别记录。
+
+Compose 内：
+API/Worker Redis URL = `redis://redis:6379/0`
+
+禁止使用：
+`redis://127.0.0.1:6379/0`
+`redis://127.0.0.1:6380/0`
+
+OpenClaw Gateway 保持运行于 WSL Ubuntu。
+RAGFlow 使用独立 Docker Compose。
+
+## 外部环境操作规则
+
+Codex 可能以 `--dangerously-bypass-approvals-and-sandbox`
+模式运行。
+
+允许自主操作：
+
+- 当前项目目录及其所有文件
+- Docker build / compose / logs / exec
+- 项目相关容器和镜像
+- 项目测试和构建命令
+- WSL 中项目相关目录
+- OpenClaw 项目相关配置
+- RAGFlow 项目相关配置
+
+即使当前运行于最高权限模式，以下操作仍禁止自动执行：
+
+- 删除当前项目之外的目录
+- 删除 Docker volume
+- `docker system prune`
+- 修改 Windows 注册表
+- 修改 Windows 系统级网络配置
+- 修改 Docker Desktop 全局配置
+- 修改 WSL 全局系统配置
+- 删除或覆盖 `.git`
+- 删除用户数据
+- 修改真实 API Key / Token / Password
+- 执行不可逆数据库操作
+- 修改与当前项目无关的文件
+
+上述高风险操作必须先说明：
+1. 为什么需要；
+2. 将修改什么；
+3. 影响范围；
+4. 回滚方式；
+
+然后等待人工
+
+## UI 实现规则
+
+`design/ui-reference/` 是本项目 UI 的视觉设计基准。
+
+实现或修改前端页面时，必须先检查对应 UI 参考图，再修改代码。
+
+优先级：
+
+1. 用户当前指令
+2. design/ui-reference/ 中对应页面
+3. design/design-2.md
+4. 当前项目已有 Design System
+5. 自主设计
+
+参考图存在时，不得自行重新设计页面。
+
+必须尽量还原：
+
+- 页面整体布局
+- Sidebar / Header
+- 内容区域宽度
+- Grid / Flex 布局
+- 卡片尺寸和排列
+- 间距
+- 圆角
+- 边框
+- 阴影
+- 字体层级
+- 图标位置
+- 按钮尺寸
+- 表格结构
+- 输入框结构
+- 空状态
+- Loading 状态
+- Hover / Active 状态
+
+允许根据项目实际业务调整：
+
+- 文案
+- 数据字段
+- API 数据
+- Agent 状态
+- Tool Call 信息
+- 权限控制
+
+禁止为了“更好看”而大幅改变参考图的视觉结构。
+
+技术栈保持：
+
+Vue 3 + TypeScript + Element Plus + Pinia
+
+不要为了还原 UI 重写为 React。
+
+优先复用组件，不要复制大量重复页面代码。
+
+页面完成后必须执行：
+
+1. frontend build
+2. Docker Compose build
+3. Docker Compose up
+4. 页面运行验证
+5. 检查 console error
+6. 检查 API 请求
+7. 更新 design/design-2-progress.md
+
+## 代码注释
+1.需要在方法名上注释代码含义，前端和后端都需要

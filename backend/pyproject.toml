@@ -11,6 +11,8 @@ dependencies = [
   "websockets>=14,<16",
   "cryptography>=44,<47",
   "python-multipart>=0.0.20,<1",
+  "aiomysql>=0.2,<1",
+  "sqlglot>=27,<29",
 ]
 
 [dependency-groups]

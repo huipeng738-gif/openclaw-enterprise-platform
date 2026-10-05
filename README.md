@@ -1,142 +1,223 @@
-# OpenClaw 企业 AI 平台（Vue + Nginx + FastAPI + Redis）
+# OpenClaw 企业智能体平台
 
-Python 依赖由 `backend/pyproject.toml` 与 `backend/uv.lock` 管理，Ubuntu 本地开发与 Docker 镜像均使用 uv 锁定安装。
+面向企业业务人员与平台管理员的智能体工作平台。用户可通过 AI 助手提交 Agent 任务、查看执行轨迹，并在知识库、订单、客户与数据分析页面查询企业数据；管理员可维护账号权限、Agent 可用性、任务策略并排查运行状态。
 
-本版本在上一版工程上加入 JWT 登录、RBAC、Redis 任务与事件持久化、真实 Gateway WebSocket 调用、Agent/Tool 事件展示、取消/超时/重试、操作审计及 Docker Compose。OpenClaw Gateway 和 RAGFlow 可以独立部署在云端；平台 Worker 通过配置的 WebSocket 地址访问 Gateway。
+> 详细的页面操作步骤、角色使用方法与常见问题见[用户使用说明书](user-manual.md)。本 README 面向项目部署者、开发者与运维人员。
 
-> Worker 通过 Gateway 执行 Agent。知识库接入独立部署的 RAGFlow；指标接口仍返回 501，等待接入现有指标服务。
+## 目录
 
-## 业务链路
+- [功能概览](#功能概览)
+- [角色与菜单权限](#角色与菜单权限)
+- [系统架构](#系统架构)
+- [数据与安全边界](#数据与安全边界)
+- [技术栈与目录](#技术栈与目录)
+- [部署要求](#部署要求)
+- [Docker Compose 部署](#docker-compose-部署)
+- [Windows 本地开发](#windows-本地开发)
+- [接口与任务状态](#接口与任务状态)
+- [运维与验收](#运维与验收)
+- [开发测试](#开发测试)
+- [相关文档](#相关文档)
+
+## 功能概览
+
+| 菜单 | 当前能力 | 可用角色 |
+| --- | --- | --- |
+| 总览 | 当前可见任务统计、任务趋势、失败任务、运行观测与 Gateway 状态 | 全部角色 |
+| AI 助手 | 选择启用的 Agent 对话，查看助手回复、Tool 过程、知识引用和实时执行轨迹 | operator、admin |
+| Agent 管理 | 查看 Agent、模型、Tool 策略及近 30 天任务统计；管理员可创建 Agent、切换平台可用状态 | 查看：全部；管理：admin |
+| 知识库 | 浏览文档和解析状态、执行检索测试；管理员可创建或关联 RAGFlow 知识库、上传解析及删除文档 | operator、admin |
+| 订单管理 | 按订单号、客户名或商品名筛选订单并查看商品明细 | operator、admin |
+| 客户管理 | 搜索客户、筛选等级和状态、查看脱敏联系方式及订单摘要 | operator、admin |
+| 数据分析 | 查询销售额、订单数、退款率和活跃客户数；提交受控的只读数据库问答任务 | operator、admin |
+| 任务中心 | 查询任务、查看事件；有任务写权限的用户可创建、取消、重试 | 查看：全部；操作：operator、admin |
+| 人工审批 | 查看 Agent 提交的任务取消申请；管理员审批他人申请 | operator、admin |
+| 运行监控 | 搜索任务、查看 Trace 和事件时间线及安全摘要 | admin |
+| 审计日志 | 搜索最近的登录、账号、任务、Agent、知识库、审批和策略操作记录 | admin |
+| 系统设置 | 管理账号角色和状态、重置密码、配置任务策略、检测依赖 | admin |
+
+**业务数据菜单当前为只读。**订单、客户和固定指标使用独立 Demo MySQL 数据；页面不提供订单写入、退款、发货或客户档案修改。系统设置的任务策略可以暂停新提交并调整默认超时，暂停不终止已运行任务。Agent 创建会在 OpenClaw Gateway 建立 Agent/Workspace；平台停用只阻止平台新任务选择，不会删除 Gateway Agent。
+
+## 角色与菜单权限
+
+| 角色 | 主要权限 |
+| --- | --- |
+| `viewer`（查看者） | 查看总览、Agent 列表和本人有权查看的任务；不能提交或变更任务。 |
+| `operator`（业务操作员） | 查看者能力，加上创建/取消/重试任务、知识检索、只读业务查询；只能查看本人任务及本人发起的审批申请。 |
+| `admin`（管理员） | 平台管理权限：查看平台任务与审计、管理账号、Agent 和知识库、修改任务策略、处理非本人发起的审批。 |
+
+权限在 FastAPI 后端按角色和资源所有权校验，前端菜单隐藏只用于界面导航，不作为授权边界。管理员账号保存在 MySQL `platform_users`，角色、停用或密码变更会使旧会话失效。创建账号和密码至少 12 位；系统保护最后一个可用管理员。
+
+## 系统架构
 
 ```mermaid
-flowchart TD
-  A["Vue 用户"] --> B["Nginx /api 与 /ws"]
-  B --> C["FastAPI JWT / RBAC"]
-  C --> D["Redis 队列与任务事件"]
-  D --> E["Python worker"]
-  E --> F["OpenClaw Gateway"]
-  F --> G["Agent / Plugin / 企业数据源"]
-  D --> C
-  C --> A
+flowchart LR
+  U[Vue 3 浏览器] --> N[Nginx]
+  N --> A[FastAPI JWT / RBAC]
+  A --> R[(Redis 队列 / 任务 / 事件)]
+  R --> W[Python Worker]
+  W <-->|Gateway WebSocket| G[OpenClaw Gateway]
+  G --> AG[Agent / Tool / Plugin]
+  A --> M[(MySQL 账号与 Demo 业务数据)]
+  A <-->|HTTPS / API| RF[RAGFlow 独立服务]
+  R --> A
+  A --> N
+  N --> U
 ```
 
-用户登录后发起任务，FastAPI 创建任务并写入 Redis；worker 启动真实 Agent run，按 `runId` 过滤 Gateway 事件，将助手文本和 Tool 名称、阶段写入 Redis Stream；浏览器通过短期一次性 WebSocket ticket 订阅该任务，刷新后可从 `/api/tasks/{id}/events` 补读。取消会向 Gateway 发送 `chat.abort`；重试会创建新的任务和独立 session，避免悄悄重复同一次执行。
+主要调用链：`Vue -> Nginx -> FastAPI -> Redis -> Worker -> OpenClaw Gateway -> Agent/Tool -> Redis 事件 -> WebSocket -> Vue`。任务提交由 API 持久化并入 Redis 队列，Worker 调用真实 Gateway run 并保存阶段事件；浏览器使用一次性短期 WebSocket ticket 订阅，断线或刷新后通过任务事件接口补读。取消向 Gateway 请求 `chat.abort`；重试创建新的任务和独立 session。
 
-| 角色 | 权限 |
+## 数据与安全边界
+
+| 数据 | 存储或来源 | 说明 |
+| --- | --- | --- |
+| 平台用户与密码摘要 | MySQL `platform_users` | MySQL 是账号主存储；旧 Redis 账号只做一次性无覆盖迁移。 |
+| 登录刷新会话、任务、队列、事件、审计、任务策略和运行心跳 | Redis | Compose 使用持久化 volume；任务事件流和审计流均有保留上限，不替代长期合规归档。 |
+| 订单、客户、商品与指标 | 独立 Demo MySQL schema | 平台业务账号对业务表只读；当前数据仅用于 Demo/开发验证，不是生产经营账本。 |
+| 企业文档与检索索引 | 外部 RAGFlow | RAGFlow 独立部署；知识库删除会删除对应的 RAGFlow 数据。 |
+| Gateway 凭据与模型配置 | 部署环境变量 / Gateway | Gateway 凭据留在服务端，不下发给浏览器；Agent 与模型由 Gateway 提供。 |
+
+业务 MySQL 初始化脚本位于 `database/migrations/`。首次创建数据卷时 MySQL 会执行初始化；已有 volume 不会自动重放新增迁移，需按版本说明手动执行相应迁移。Redis 保存任务当前运行数据，单个任务事件流最多保留约 2,000 条记录，审计流最多约 10,000 条。生产环境需要独立规划备份、保留周期和审计归档。
+
+开放式数据库问答由专用 Worker 流程生成候选查询，服务端以 SQL AST、表列/函数白名单、参数绑定、只读账号和行数限制执行单条只读查询。它不会把普通聊天 Agent 暴露成拥有任意 SQL 执行权限的工具。审批中的高风险动作当前为平台任务取消申请；订单/客户数据仍不可由该流程写入。
+
+## 技术栈与目录
+
+- 前端：Vue 3、TypeScript、Element Plus、Pinia、Vite
+- API / Worker：Python、FastAPI、Redis 异步客户端
+- 持久化：Redis（任务与运行态）、MySQL 8.4（用户和 Demo 业务数据）
+- Agent Runtime：OpenClaw Gateway WebSocket
+- 知识库：独立 RAGFlow 服务
+- 部署：Docker Compose、Nginx、Docker volumes
+
+| 路径 | 职责 |
 | --- | --- |
-| viewer | 查看自己的任务、查看可选 Agent |
-| operator | viewer 权限，加上创建/取消/重试任务及知识库检索 |
-| admin | operator 权限，加上创建用户、查看所有任务与审计日志 |
+| `frontend/` | Vue 页面、登录、菜单、任务提交与实时事件展示 |
+| `backend/app/` | FastAPI、权限检查、Worker、Gateway 客户端、数据服务与任务处理 |
+| `backend/tests/` | 后端测试 |
+| `database/migrations/` | MySQL schema、Demo 数据及迁移脚本 |
+| `plugin/` | OpenClaw 企业数据 Plugin / Tool 与 Skills |
+| `nginx/` | 静态资源托管、API/WebSocket 反向代理 |
+| `scripts/` | 初始化、Windows 启动、插件安装和验收脚本 |
+| `evaluation/` | 离线 Agent 评测数据与报告 |
+| `design/` | UI 参考、产品设计与实施进度资料（如当前分支包含） |
 
-后端每个接口校验角色与任务所有权；隐藏前端菜单并不构成授权。Gateway 凭据仅在 worker 环境变量中，浏览器只收到企业平台的 JWT。审计记录包括登录、创建用户、任务创建、取消和重试，不记录密码、Gateway token 和工具参数。Redis AOF 保存任务与事件；单 worker 串行消费，扩展为多 worker 前需要增加分布式锁及可靠队列。
+Python 依赖由 `backend/pyproject.toml` 与 `backend/uv.lock` 管理；本地及 Docker 使用 uv 锁定依赖。
 
-## 一、用 Docker Compose 运行（Ubuntu / WSL2）
+## 部署要求
 
-### 安装 Docker（仅你的 Ubuntu / WSL2 主机）
+- Docker Engine 与 Docker Compose Plugin（Compose 部署）
+- 可由 Worker 访问的 OpenClaw Gateway WebSocket 地址，协议应与项目客户端兼容；`http://` 管理页面地址不能代替 Gateway WebSocket 地址
+- 配置正确的 Gateway Agent、模型和 Tool 策略
+- 若使用知识库，部署 API 可达的 RAGFlow 服务并准备 API Key
+- Linux / WSL 部署命令按需使用 `sudo`；下文示例按有 Docker 权限书写
 
-本项目使用 Compose bridge 网络。Worker 从 `.env` 读取 `OPENCLAW_GATEWAY_URL`，云端 Gateway 需提供 Worker 可达的 `ws://` 或 `wss://` WebSocket 端点；`http://` 管理页面地址不能直接用于 Gateway 连接。
+Gateway 必须保持在 WSL Ubuntu/宿主机可运行的独立环境中。RAGFlow 也作为独立服务部署，不由本项目 Compose 创建。
 
-Ubuntu 24.04/22.04 在 **同一 WSL Ubuntu 实例** 内，按 [Docker 官方 Ubuntu 安装说明](https://docs.docker.com/engine/install/ubuntu/) 配置仓库并安装（已经安装 Docker 的主机直接运行下面的版本检查即可）：
+## Docker Compose 部署
+
+以下命令在项目根目录执行。首次部署前先配置环境并检查 Compose 展开结果。
+
+### 1. 准备环境文件
 
 ```bash
-sudo apt update
-sudo apt install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo systemctl enable --now docker
-docker --version
-docker compose version
-sudo docker run hello-world
+cp .env.example .env
+python3 scripts/init_business_env.py
 ```
 
-WSL 内需要启用 systemd 才能使用上述 `systemctl` 命令。安装只在你的宿主机执行，本交付包不会修改系统级 Docker 配置。若 apt 报告已有 `docker.io`、旧 Compose 或 `containerd` 冲突，先阅读官方文档的“Uninstall old versions”，核实本机服务和数据再处理。
+编辑 `.env`，配置 `JWT_SECRET`、`PLUGIN_SERVICE_TOKEN`、`OPENCLAW_GATEWAY_URL` 和 `OPENCLAW_GATEWAY_TOKEN`。`JWT_SECRET` 与插件服务令牌应使用独立的强随机值；不要提交 `.env` 或 `.env.business`。`scripts/init_business_env.py` 仅在文件不存在时生成本地 Demo MySQL 凭据，不覆盖现有值。
 
-### 启动与验收
+常用配置：
 
-1. 确认 OpenClaw Gateway 在同一台 Ubuntu / WSL2 宿主机运行，并且 agent 配置及模型正常：
+| 变量 | 用途 |
+| --- | --- |
+| `JWT_SECRET` | JWT 签名密钥，至少 32 字符 |
+| `ACCESS_TOKEN_EXPIRE_MINUTES`、`REFRESH_TOKEN_EXPIRE_DAYS` | 登录会话时长 |
+| `REFRESH_COOKIE_SECURE`、`AUTH_ORIGIN` | Refresh Cookie 与来源策略；公网部署应配合 HTTPS 设置 |
+| `OPENCLAW_GATEWAY_URL`、`OPENCLAW_GATEWAY_TOKEN` | Worker 连接 Gateway 的 WebSocket 地址与凭据 |
+| `ALLOWED_AGENTS` | 初始化平台可用 Agent ID 列表，需与 Gateway 配置对齐 |
+| `PLUGIN_SERVICE_TOKEN` | 后端 Plugin 内部接口认证；Gateway Plugin 进程需配置相同值 |
+| `RAGFLOW_BASE_URL`、`RAGFLOW_API_KEY` | 可选的 RAGFlow 连接配置，仅由后端使用 |
+| `RAGFLOW_TIMEOUT_SECONDS`、`RAGFLOW_DATASET_IDS` | RAGFlow 请求超时与可选数据集配置 |
 
-   ```bash
-   openclaw gateway status
-   openclaw agents list
-   ```
+Compose 中 API/Worker 访问 Redis 必须使用 `redis://redis:6379/0`。不要将容器内 Redis 地址改成 `127.0.0.1`。
 
-2. 解压工程，配置密钥：
+### 2. 检查配置并启动
 
-   ```bash
-   unzip openclaw-enterprise-platform.zip
-   cd openclaw-enterprise-platform
-   cp .env.example .env
-   python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
-   ```
-
-   把随机值分别填入 `.env` 的 `JWT_SECRET` 和 `PLUGIN_SERVICE_TOKEN`。从 Gateway 宿主机的交互终端运行 `openclaw gateway auth-token --show`，把输出填入 `OPENCLAW_GATEWAY_TOKEN`；不要把 `.env` 提交到 Git。`ALLOWED_AGENTS` 与 `openclaw agents list` 的 ID 对齐。
-
-3. 启动容器并创建第一个管理员：
-
-   ```bash
-   sudo docker compose config --quiet
-   sudo docker compose up -d --build
-   sudo docker compose ps
-   sudo docker compose exec -e BOOTSTRAP_ADMIN_USER=admin -e BOOTSTRAP_ADMIN_PASSWORD='换成至少12位的强密码' api python -m app.bootstrap
-   ```
-
-   访问 `http://127.0.0.1/`，用刚创建的管理员登录。Nginx 对外监听 80，FastAPI 仅通过宿主机 `127.0.0.1:8100` 提供插件接口，Redis 仅在 Compose 内部网络开放。确认 Worker 可以访问配置的云端 Gateway WebSocket。
-
-4. 首次 Gateway 设备配对：先在页面创建一条测试任务，然后查看：
-
-   ```bash
-   sudo docker compose logs worker --tail=80
-   openclaw devices list
-   ```
-
-   如果出现 `PAIRING_REQUIRED`，用 `openclaw devices approve <requestId>` 批准对应请求，再在页面点“重试”。worker 的设备私钥放在 `device_identity` Docker volume，重建容器时不要删除该卷。Gateway 协议与客户端需一起核对版本；这里按当前协议版本 4 实现，升级 OpenClaw 后应先做联调。
-
-5. 在 Gateway 所在宿主机执行 `bash scripts/install_plugin.sh` 安装 `knowledge_search` 插件。插件进程需要能读取与 API 相同的 `PLUGIN_SERVICE_TOKEN` 环境变量。云端 Gateway 应设置 `KNOWLEDGE_URL` 为从 Gateway 主机可达的 `https://<platform-host>/knowledge/search` 后再执行脚本；本地默认地址 `127.0.0.1:8100` 只适用于 Gateway 与 API 同机。指标接口仍返回 501。
-
-6. 执行自动验收：`sudo bash scripts/verify_docker.sh`。它会先执行 `docker compose config --quiet`，再检查 Vue 首页、FastAPI/Redis 健康状态、JWT 登录，创建一条真实 OpenClaw Agent 任务，等待完成并读取事件。脚本会交互式要求账号密码，失败时返回非零退出码；若 Gateway 要求设备配对，先完成第 4 步再重试。
-
-7. 创建业务账号：在浏览器登录后，向 `POST /api/users` 发送 `Authorization: Bearer <JWT>`，请求体如 `{"username":"analyst","password":"至少12位的强密码","role":"operator"}`。管理员也可以从 FastAPI `/docs` 中测试；凭据不要保存到共享终端历史。日志：`sudo docker compose logs -f api worker web`。停止：`sudo docker compose down`（不加 `-v`，保留 Redis 和设备身份卷）。
-
-## 二、Windows 启动应用，连接 WSL Ubuntu Docker
-
-**开发阶段：**Vue、FastAPI、Worker 可在 Windows PowerShell 运行；Redis 和 Gateway 需要单独启动并确认 Windows 可达。**部署阶段：**在 WSL Ubuntu 使用根目录 `compose.yaml` 启动平台。
-
-Windows 需要安装 Python 3.12、uv、Node 22+ 和 npm；Ubuntu 部署需要 Docker Compose 与已启动的 Gateway。在 Windows PowerShell 检查 Redis 与 Gateway 是否可达：
-
-```powershell
-Test-NetConnection 127.0.0.1 -Port 6379
-Test-NetConnection 127.0.0.1 -Port 18789
+```bash
+docker compose config --quiet
+docker compose ps
+docker compose up -d --build
+docker compose ps
 ```
 
-两项都应显示 `TcpTestSucceeded : True`。如果服务不在 localhost，按实际地址设置 `REDIS_URL` 和 `OPENCLAW_GATEWAY_URL`。不要为了调通连接把 Redis 或 Gateway 直接暴露到公网。
+Compose 服务包括 `web`（Nginx）、`api`、`worker`、`redis` 与 `mysql`。当前端口映射为：Nginx `80:80`，API 仅绑定宿主机 `127.0.0.1:8100`，Redis `6380:6379`。Redis 端口虽供宿主机本地工具连接，但不应通过公网暴露；按实际部署网络限制访问。
 
-在 Windows PowerShell 进入工程，复制 `.env.example` 为 `.env`，填写 `JWT_SECRET`、`OPENCLAW_GATEWAY_TOKEN`、`PLUGIN_SERVICE_TOKEN` 等真实配置。默认 `REDIS_URL=redis://127.0.0.1:6379/0` 和 `OPENCLAW_GATEWAY_URL=ws://127.0.0.1:18789`，如使用其他转发端口可在 `.env` 中覆盖。依赖安装和管理员初始化在 Windows 执行：
+### 3. 创建首个管理员并登录
+
+```bash
+docker compose exec -e BOOTSTRAP_ADMIN_USER=admin -e BOOTSTRAP_ADMIN_PASSWORD='替换为至少12位的强密码' api python -m app.bootstrap
+```
+
+该命令创建 MySQL 管理员账号。浏览器打开 `http://127.0.0.1/`，使用该账号登录。首次部署由 MySQL volume 自动执行迁移。**使用已有 MySQL volume 升级**时，初始化目录不会自动重跑；若该库尚无平台用户表，先在维护窗口执行：
+
+```bash
+docker compose exec -T mysql sh /docker-entrypoint-initdb.d/006_platform_users.sh
+```
+
+迁移前需核对目标环境及备份状态。其他 schema 更新请依照 `database/migrations/` 中迁移说明逐项执行。
+
+### 4. 完成 Gateway 配对与 Plugin 配置
+
+提交一条测试任务后检查 Worker 日志：
+
+```bash
+docker compose logs worker --tail=80
+openclaw devices list
+```
+
+若出现 `PAIRING_REQUIRED`，在 Gateway 所在主机批准对应请求：
+
+```bash
+openclaw devices approve <requestId>
+```
+
+再从页面重试任务。Worker 设备身份保存在 Docker volume；不要为普通容器重建删除持久化卷。将 `plugin/` 中企业 Plugin 安装到 Gateway 环境（见 `scripts/install_plugin.sh`），并确保 Gateway 进程可读取相同 `PLUGIN_SERVICE_TOKEN`。云端 Gateway 还需把 `KNOWLEDGE_URL`、`BUSINESS_URL`、`METRICS_URL` 配置为其网络可达的平台地址。
+
+### 5. 验收与常用运维命令
+
+```bash
+docker compose ps
+docker compose exec redis redis-cli ping
+curl -i http://127.0.0.1/health
+bash scripts/verify_docker.sh
+docker compose logs -f api worker web
+docker compose down
+```
+
+`verify_docker.sh` 会验证 Compose 配置并调用项目验收脚本；真实 Gateway 验收要求目标 Gateway 在线、模型可用且设备已配对。`docker compose down` 保留 Redis/MySQL/Worker 身份卷；不要为了普通停止使用 `docker compose down -v`。
+
+### 6. Windows / WSL 边界
+
+Windows 可运行前端、FastAPI 和 Worker 进行本地开发；Redis 与 Gateway 必须从 Windows 进程可达。Compose 部署运行于 WSL Ubuntu 时，应在该 Linux 环境执行 Docker Compose 命令，并将 Gateway 地址配置成容器可访问的 WSL/宿主地址。不要假设 Windows 的 `127.0.0.1` 在 Docker 容器内仍指向 Windows 服务。
+
+## Windows 本地开发
+
+需要 Python 3.12、uv、Node.js 22+、npm，以及可访问的 Redis 和 OpenClaw Gateway。将 `.env.example` 复制为 `.env`，配置密钥、Redis 和 Gateway 地址；本地默认 Redis 为 `redis://127.0.0.1:6379/0`，Gateway 默认地址按 `.env.example` 设置。
 
 ```powershell
-Set-Location D:\agent_framework\openclaw-enterprise-platform
 Copy-Item .env.example .env
 Set-Location backend
 uv sync --frozen --no-dev
 $env:BOOTSTRAP_ADMIN_USER = 'admin'
-$env:BOOTSTRAP_ADMIN_PASSWORD = '换成至少12位的强密码'
+$env:BOOTSTRAP_ADMIN_PASSWORD = '替换为至少12位的强密码'
 uv run --frozen --no-dev --env-file ../.env python -m app.bootstrap
 Set-Location ../frontend
 npm.cmd ci
 Set-Location ..
 ```
 
-在 Windows 打开三个独立 PowerShell 终端，从项目根目录分别运行；如果系统禁止执行 `.ps1`，在**当前终端**先运行 `Set-ExecutionPolicy -Scope Process Bypass`：
+从项目根目录在三个 PowerShell 终端分别运行：
 
 ```powershell
 .\scripts\start_backend_windows.ps1
@@ -144,69 +225,78 @@ Set-Location ..
 .\scripts\start_frontend_windows.ps1
 ```
 
-访问 `http://127.0.0.1:5173`，验证登录、创建任务、WebSocket 事件及取消/重试。Windows Worker 的设备身份保存在 `backend/.data/`；切到 Docker Worker 时会产生另一份设备身份，可能需要再次批准配对。
+访问 `http://127.0.0.1:5173`。Windows Worker 设备身份存放在 `backend/.data/`；切换到 Compose Worker 后 Gateway 可能需要对新身份再次配对。管理员初始化仅适用于已配置并可访问的 MySQL 数据库。
 
-本地验证完成后，停止三个 Windows 开发终端，确保 Windows 的 8100、5173 端口已释放。在 WSL Ubuntu 项目目录执行部署：
+## 接口与任务状态
+
+浏览器接口由 Nginx 的 `/api/` 代理至 FastAPI，实时任务使用 `/ws/` WebSocket。FastAPI `/docs` 提供当前安装版本的 OpenAPI 路由与字段定义。
+
+| 路由示例 | 用途 |
+| --- | --- |
+| `POST /api/auth/login`、`GET /api/auth/me` | 登录与当前账号 |
+| `/api/users`、`/api/settings/*` | 管理账号、任务策略与依赖状态（管理员） |
+| `/api/agents`、`/api/agents/manage` | Agent 列表、管理与创建 |
+| `POST /api/chat`、`POST /api/tasks` | 创建 Agent 对话或任务 |
+| `GET /api/tasks`、`GET /api/tasks/{id}`、`GET /api/tasks/{id}/events` | 查询任务及历史事件 |
+| `POST /api/tasks/{id}/ws-ticket`、`WS /ws/tasks/{id}?ticket=…` | 获取一次性短期票据并订阅实时事件 |
+| `POST /api/tasks/{id}/cancel`、`POST /api/tasks/{id}/retry` | 取消或创建重试任务 |
+| `/api/knowledge/*`、`/api/orders/*`、`/api/customers/*`、`/api/metrics/*` | 知识库、业务只读查询和指标 |
+| `/api/approvals/*`、`/api/audit`、`/api/monitor/*` | 审批、审计与管理员运行监控 |
+
+任务状态为 `queued -> running -> completed / failed / cancelled / timed_out`。系统展示真实状态和事件，不生成虚构百分比。WebSocket 中断可通过历史事件接口恢复展示。普通 Tool 事件只保留安全摘要；不应把原始工具参数、Token 或凭证写入日志。
+
+Plugin 内部路由如 `/knowledge/search` 与 `/metrics/query` 使用 `X-Plugin-Token`，不面向浏览器用户；调用时应由 Gateway Plugin 服务端发起。具体 API schema 以代码和 `/docs` 为准。
+
+## 运维与验收
+
+- 健康检查：`GET /health` 检查 API 服务；它本身不代表 Worker 或 Gateway 可用。
+- Gateway 状态：依赖 Worker 最近的真实 Gateway 握手；无有效检测记录时显示未知。
+- 日志：使用 `docker compose logs api worker web`，避免输出环境文件、认证头、密码或 Token。
+- 旧数据卷迁移：MySQL 初始化 SQL 只在新 volume 上自动执行；升级前核对对应迁移脚本及数据备份。
+- 数据留存：Redis 任务事件与审计采用有限长度保留；如需长期审计，请规划外部归档与备份。
+- 并发扩展：当前 Worker 消费与任务执行按项目现有机制工作；扩展多个 Worker 前应验证并发、幂等、Gateway 限额和重复执行语义。
+
+公网部署前需在入口配置 HTTPS、证书、Cookie Secure、来源策略、防火墙和 WebSocket 代理，并限制 Redis 与 API 管理端口访问。当前 Compose Nginx 默认 HTTP `:80`，不能视为已启用 TLS 的生产配置。
+
+## 开发测试
+
+后端测试：
 
 ```bash
-docker compose up -d --build
-docker compose ps
+cd backend
+uv sync --frozen
+PYTHONPATH=. JWT_SECRET=testing-secret-of-at-least-32-bytes uv run --frozen pytest -q tests
 ```
 
-按第一节初始化容器中的管理员、批准容器 Worker 的设备配对，并运行 `bash scripts/verify_docker.sh`。不要运行 `docker compose down -v`，否则 Redis 数据卷会被删除。
+前端生产构建：
 
-## API 与状态
-
-- `POST /api/auth/login`：JWT 登录；`GET /api/auth/me`：当前账号
-- `POST /api/users`：管理员创建用户
-- `GET /api/agents`、`GET /api/dashboard`：可选 Agent 与统计
-- `POST /api/chat`、`POST /api/tasks`：入队，返回任务 ID
-- `GET /api/tasks`、`GET /api/tasks/{id}`、`GET /api/tasks/{id}/events`：查询与补读事件
-- `POST /api/tasks/{id}/ws-ticket`、`WS /ws/tasks/{id}?ticket=...`：一次性 30 秒票据，实时状态
-- `POST /api/tasks/{id}/cancel`、`POST /api/tasks/{id}/retry`：取消、重试
-- `GET /api/audit`：管理员审计记录
-- `GET/POST /api/knowledge/bases`、`GET/DELETE /api/knowledge/bases/{id}`：知识库管理
-- `GET/POST /api/knowledge/bases/{id}/documents`、文档状态、解析和删除接口：文档管理
-- `POST /api/knowledge/retrieval`：按 RBAC 检索并返回 Chunk、分数与来源
-- `POST /knowledge/search`：仅插件可用的检索接口，要求 `X-Plugin-Token`；`POST /metrics/query` 仍待接入指标服务
-
-任务状态为 `queued → running → completed/failed/cancelled/timed_out`。进度不显示虚构百分比。普通 Tool 事件只保存名称、阶段和调用 ID；`knowledge_search` 额外保存有限长度的 query、结果数及真实文档来源，不转发完整工具输出。任务结果来自 Gateway 的 assistant 事件；若该版本 Gateway 不提供文本，需对照 `chat.history` 适配结果提取。
-
-## 部署边界和注意事项
-
-- 当前 Nginx 容器默认 **HTTP :80**。公网部署前应配置 HTTPS 证书、443、HTTP→HTTPS 跳转和防火墙；不要把当前 HTTP 配置直接当作已启用 TLS 的生产配置
-- 用户 JWT 仅保存在浏览器内存，刷新页面需重新登录；建议在正式 SSO/长期会话接入时换成 HttpOnly Cookie + CSRF 防护
-- WebSocket ticket 会出现在 URL 中，有 30 秒 TTL 且只能使用一次；公网反代的访问日志应去掉查询字符串
-- worker 崩溃后，已在运行的任务会标记失败；重试前先确认 Gateway 原 run 状态，以免产生重复业务操作
-- Redis Stream 仅保留最近 2000 条任务事件和 10000 条审计事件。长期留存/合规审计应写入独立数据库和备份系统
-- 项目没有真实的 OpenClaw Gateway 和原业务插件可在此环境直接连通，部署后按上面的测试任务及设备配对步骤完成端到端验收
-
-测试后端（可不启动 Docker）：`cd backend && uv sync --frozen && PYTHONPATH=. JWT_SECRET=testing-secret-of-at-least-32-bytes uv run --frozen pytest -q tests`。
-
-参考：[Gateway 外部应用接入](https://docs.openclaw.ai/gateway/external-apps)、[Gateway 协议](https://docs.openclaw.ai/gateway/protocol)、[客户端认证与 Tool Events](https://docs.openclaw.ai/gateway/clients)。
-
-## RAGFlow 知识库
-
-企业知识问答、文档草稿两个 OpenClaw Skill 已随企业插件提供。部署检查、调用示例与验收步骤见 [Skill 试点说明](plugin/SKILLS_README.md)；首期保持现有前端、任务 API 和 Worker 调用链。
-
-RAGFlow 作为本地或云端的独立服务运行。在其管理界面创建 API Key，并将以下值只写入本项目后端的 `.env`：
-
-```text
-RAGFLOW_BASE_URL=https://<your-ragflow-host>
-RAGFLOW_API_KEY=<ragflow-api-key>
-RAGFLOW_TIMEOUT_SECONDS=30
+```bash
+cd frontend
+npm ci
+npm run build
 ```
 
-`RAGFLOW_BASE_URL` 必须从 API 容器或后端进程可达。`RAGFLOW_API_KEY` 不进入 Vue、Nginx 或插件配置。浏览器通过 Nginx 的 `/api/knowledge/` 路由访问 FastAPI，Nginx 现有 `/api/` 转发规则已覆盖这些路径。
+Compose 配置检查：
 
-如果 RAGFlow 运行在 Windows 宿主机，而本平台运行在 Docker Desktop 容器中，`.env` 使用 `RAGFLOW_BASE_URL=http://host.docker.internal:8080`（端口按 RAGFlow 实际映射调整）；容器中的 `localhost` 指向容器自身。修改 `.env` 后执行 `docker compose up -d --force-recreate api worker` 使新配置生效。
+```bash
+python3 scripts/init_business_env.py
+docker compose config --quiet
+```
 
-管理员登录后进入“知识库”，创建知识库或关联已有 RAGFlow 数据集，上传文档，点击“解析”，再刷新查看状态。状态由 RAGFlow 的 `run` 字段映射为 pending、parsing、completed、failed。检索测试可选择知识库、输入问题、调整返回条数和相似度阈值；结果直接显示 Chunk、分数和来源，不调用 LLM。管理员可删除文档和知识库，删除知识库会删除其 RAGFlow 数据。
+指标 Demo 数据核验可在 API 容器中执行 `docker compose exec api uv run python -m app.verify_metrics`；数据库只读查询核验为 `docker compose exec api uv run python -m app.verify_database`。`app.verify_database_agent` 会创建一条真实 Gateway 探测任务，应仅在专用验收环境运行。
 
-Agent 调用 `knowledge_search` 时，插件只向 FastAPI 内部 `POST /knowledge/search` 发检索请求，后端再调用 RAGFlow。插件从 Gateway 进程环境读取 `PLUGIN_SERVICE_TOKEN`，与 API 的值必须相同。为 Agent 配置工具策略时只允许 `knowledge_search`，不要授予管理类 API。Worker 保留 Gateway 的 Tool 事件；如果 Gateway 的 Tool 结果事件包含检索结果，任务快照会携带真实文档来源供聊天页展示。没有结果时来源列表为空。
+Agent 离线评测数据 `evaluation/demo_cases.json` 是 Demo/开发测试集，覆盖 Knowledge、Order、Customer、Metrics、Database、Action、HITL 场景，并包含预期失败案例。运行：
 
-常见排查：503 表示后端未配置 RAGFlow；502/504 表示 RAGFlow 返回错误、不可达或超时；空知识库检索返回空结果，需先上传并解析文档；RAGFlow Cloud 若提示 API Key 需要 Starter/Pro 套餐，需在云端解决账号权限后再验收；平台返回 403 表示 RBAC 不允许当前操作。插件报未配置时检查 Gateway 进程的 `PLUGIN_SERVICE_TOKEN` 和 `knowledgeUrl`。云端插件要能通过 HTTPS 访问平台 `/knowledge/search`；本项目 Nginx 提供该路由，但当前 Compose 只监听 HTTP，跨互联网部署需配置 TLS 入口。不要在日志中打印 API Key。
+```bash
+cd backend
+uv run python -m app.evaluation --dataset ../evaluation/demo_cases.json --report ../evaluation/phase9-report.json
+```
 
-本地验证命令：`cd backend && uv run python -m pytest -q && uv run python -m compileall app`，`cd frontend && npm run build`，以及在配置好 `.env` 后运行 `docker compose config --quiet`。真实 RAGFlow 与 Gateway 的端到端验收需要使用目标部署环境执行。
+离线评测分数仅表示该模拟数据集的结果，不代表真实 Agent 或生产质量。真实调用评估应使用已记录运行数据；缺少真实价格时成本字段保持未知。
 
-完整知识库任务验收：在项目根目录运行 `uv run --project backend python scripts/verify_knowledge.py --query "你的知识库问题"`。脚本要求账号具有创建任务的权限；默认交互输入账号密码，也可以从已忽略提交的 `.env` 读取 `VERIFY_USERNAME` 和 `VERIFY_PASSWORD`，验证后移除这两项。它通过 Nginx 登录并提交聊天任务，验证真实 Worker 的 Tool 开始/结果事件、WebSocket 终态回答、文档来源和事件回放；不会打印密码、JWT、WebSocket ticket 或文档正文。
+## 相关文档
+
+- [用户使用说明书](user-manual.md)：所有菜单的业务操作步骤、角色适用范围与常见问题。
+- [企业 Skill 试点说明](plugin/SKILLS_README.md)：知识问答与文档草稿 Skill 的行为和限制。
+- `database/migrations/`：MySQL 初始结构及版本迁移脚本。
+- [OpenClaw Gateway 外部应用接入](https://docs.openclaw.ai/gateway/external-apps)、[Gateway 协议](https://docs.openclaw.ai/gateway/protocol)、[Gateway 客户端](https://docs.openclaw.ai/gateway/clients)。

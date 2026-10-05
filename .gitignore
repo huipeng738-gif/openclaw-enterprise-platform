@@ -4,6 +4,7 @@ frontend/dist/
 plugin/node_modules/
 *.log
 .env
+.env.business
 backend/app/__pycache__/
 *.pyc
 backend/.data/
