@@ -1,4 +1,6 @@
 
+Phase 4 新增 `order_query` 与 `customer_query`，保留原有 `knowledge_search`；Phase 5 新增 `metrics_query`。业务 Tool 只接受精确编号，通过 `businessUrl` 调用受控 FastAPI 接口；指标 Tool 通过 `metricsUrl` 查询代码注册的指标。插件不直接连接 MySQL。数据库是独立 Demo 数据源，客户手机号在后端脱敏。安装脚本可通过 `BUSINESS_URL` 设置 Gateway 可达的平台 API 地址，插件进程还需要现有 `PLUGIN_SERVICE_TOKEN`。
+
 #  openclaw.plugin.json:这个插件是谁、有什么能力和配置
 {
   /*
@@ -22,12 +24,12 @@
 
   /*
    * Tool 能力声明：
-   * 声明 enterprise-data-tools 提供 knowledge_search。
+   * 声明 enterprise-data-tools 提供 knowledge_search、order_query、customer_query、metrics_query。
    * 这里只是声明 Tool，真正的实现仍然在 src/index.ts 中通过
    * api.registerTool(...) 完成。
    *
    * 对应关系：
-   * contracts.tools → knowledge_search
+   * contracts.tools → knowledge_search / order_query / customer_query / metrics_query
    *                         ↓
    *                  src/index.ts
    *                         ↓
@@ -35,14 +37,18 @@
    */
   "contracts": {
     "tools": [
-      "knowledge_search"
+      "knowledge_search",
+      "order_query",
+      "customer_query",
+      "metrics_query"
     ]
   },
 
   /*
    * 插件配置 Schema：
    * knowledgeUrl：知识库查询接口，后续 knowledge_search Tool 调用该接口
-   * metricsUrl：系统指标查询接口，目前只是配置项，并不代表已经注册 metrics Tool
+   * businessUrl：订单与客户查询接口
+   * metricsUrl：已注册的系统指标查询接口
    * timeoutMs：HTTP 请求超时时间，默认 15000ms（15 秒）
    *
    * additionalProperties=false 表示不允许配置 Schema 之外的其他字段。
@@ -61,6 +67,10 @@
       "metricsUrl": {
         "type": "string",
         "default": "http://127.0.0.1:8100/metrics/query"
+      },
+      "businessUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8100"
       },
       "timeoutMs": {
         "type": "integer",

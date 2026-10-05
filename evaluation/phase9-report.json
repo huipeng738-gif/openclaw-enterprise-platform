@@ -1,0 +1,33 @@
+{
+  "source": "demo_fixture",
+  "sampleCount": 7,
+  "rates": {
+    "approvalStatus": 100.0,
+    "citationAccuracy": 0.0,
+    "parameterAccuracy": 83.3,
+    "sideEffectBeforeApproval": 100.0,
+    "sqlExecutionSuccess": 100.0,
+    "taskSuccess": 100.0,
+    "toolSelection": 100.0
+  },
+  "p50LatencyMs": 140,
+  "p95LatencyMs": 260,
+  "totalTokens": 159,
+  "tokenCostUsd": null,
+  "badCases": [
+    {
+      "id": "knowledge-citation",
+      "category": "Knowledge",
+      "failedChecks": [
+        "citationAccuracy"
+      ]
+    },
+    {
+      "id": "customer-number",
+      "category": "Customer",
+      "failedChecks": [
+        "parameterAccuracy"
+      ]
+    }
+  ]
+}

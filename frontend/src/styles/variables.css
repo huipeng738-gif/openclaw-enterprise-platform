@@ -1,0 +1,30 @@
+:root {
+  --oc-bg: #f5f7fb;
+  --oc-surface: #fff;
+  --oc-text: #1e293b;
+  --oc-muted: #64748b;
+  --oc-border: #e2e8f0;
+  --oc-primary: #4565d8;
+  --oc-ai: #7458c6;
+  --oc-success: #16825d;
+  --oc-warning: #ad6a08;
+  --oc-danger: #c5414e;
+  --oc-radius: 12px;
+  --oc-space: 8px;
+  --oc-shadow: 0 8px 24px rgb(30 41 59 / 5%);
+}
+
+/* Future dark mode can override tokens without changing page selectors. */
+:root[data-theme='dark'] {
+  --oc-bg: #111827;
+  --oc-surface: #1f2937;
+  --oc-text: #f1f5f9;
+  --oc-muted: #aebbd0;
+  --oc-border: #374151;
+  --oc-primary: #94a9ff;
+  --oc-ai: #b7a1f4;
+  --oc-success: #6bd8a9;
+  --oc-warning: #f7bf70;
+  --oc-danger: #ff8892;
+  --oc-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+}

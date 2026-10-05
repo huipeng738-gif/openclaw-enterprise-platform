@@ -3,6 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGIN_DIR="$ROOT/plugin"
 KNOWLEDGE_URL="${KNOWLEDGE_URL:-http://127.0.0.1:8100/knowledge/search}"
+BUSINESS_URL="${BUSINESS_URL:-http://127.0.0.1:8100}"
+METRICS_URL="${METRICS_URL:-http://127.0.0.1:8100/metrics/query}"
 command -v openclaw >/dev/null || { echo "openclaw command not found"; exit 1; }
 cd "$PLUGIN_DIR"
 # WSL mounts can expose Windows files as world-writable; OpenClaw rejects them.
@@ -16,7 +18,8 @@ if (( (8#$PLUGIN_MODE & 2) != 0 )); then
 fi
 openclaw plugins install --link "$PLUGIN_DIR" --force --accept-capabilities
 openclaw config set plugins.entries.enterprise-data-tools.config.knowledgeUrl "$KNOWLEDGE_URL"
-openclaw config set plugins.entries.enterprise-data-tools.config.metricsUrl "http://127.0.0.1:8100/metrics/query"
+openclaw config set plugins.entries.enterprise-data-tools.config.businessUrl "$BUSINESS_URL"
+openclaw config set plugins.entries.enterprise-data-tools.config.metricsUrl "$METRICS_URL"
 openclaw config set plugins.entries.enterprise-data-tools.config.timeoutMs 15000
 openclaw plugins enable enterprise-data-tools
 openclaw plugins inspect enterprise-data-tools --runtime

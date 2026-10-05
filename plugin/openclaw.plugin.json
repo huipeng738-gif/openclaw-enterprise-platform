@@ -2,14 +2,15 @@
   "id": "enterprise-data-tools",
   "name": "Enterprise Data Tools",
   "version": "1.0.0",
-  "description": "Enterprise knowledge and metrics tools for OpenClaw",
+  "description": "Enterprise knowledge and deterministic business tools for OpenClaw",
   "activation": {"onStartup": true},
-  "contracts": {"tools": ["knowledge_search"]},
+  "contracts": {"tools": ["knowledge_search", "order_query", "customer_query", "metrics_query", "task_create", "task_cancel_request"]},
   "skills": ["./skills"],
   "configSchema": {
     "type": "object",
     "properties": {
       "knowledgeUrl": {"type": "string", "default": "http://127.0.0.1:8100/knowledge/search"},
+      "businessUrl": {"type": "string", "default": "http://127.0.0.1:8100"},
       "metricsUrl": {"type": "string", "default": "http://127.0.0.1:8100/metrics/query"},
       "timeoutMs": {"type": "integer", "default": 15000}
     },

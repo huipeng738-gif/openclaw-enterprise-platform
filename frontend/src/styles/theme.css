@@ -1,0 +1,11 @@
+* { box-sizing: border-box; }
+html, body, #app { min-height: 100%; margin: 0; }
+body { font-family: Inter, 'Microsoft YaHei', Arial, sans-serif; background: var(--oc-bg); color: var(--oc-text); }
+.muted { color: var(--oc-muted); }
+:root {
+  --el-color-primary: #4565d8;
+  --el-border-radius-base: 8px;
+  --el-border-color: var(--oc-border);
+  --el-bg-color: var(--oc-surface);
+}
+:root[data-theme='dark'] { --el-color-primary: #94a9ff; --el-text-color-primary: var(--oc-text); --el-fill-color-blank: var(--oc-surface); }

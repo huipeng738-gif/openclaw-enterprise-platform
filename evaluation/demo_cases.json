@@ -1,0 +1,48 @@
+{
+  "source": "demo_fixture",
+  "description": "Demo / Development Test Data. Synthetic observations; not production Agent quality.",
+  "cases": [
+    {
+      "id": "knowledge-citation",
+      "category": "Knowledge",
+      "expected": {"status": "completed", "tool": "knowledge_search", "parameters": {"query": "退款政策"}, "citations": ["doc-demo-1"]},
+      "observed": {"status": "completed", "tool": "knowledge_search", "parameters": {"query": "退款政策"}, "citations": [], "latencyMs": 180, "tokenUsage": 24}
+    },
+    {
+      "id": "order-number",
+      "category": "Order",
+      "expected": {"status": "completed", "tool": "order_query", "parameters": {"order_no": "ORD-DEMO-001"}},
+      "observed": {"status": "completed", "tool": "order_query", "parameters": {"order_no": "ORD-DEMO-001"}, "latencyMs": 95, "tokenUsage": 18}
+    },
+    {
+      "id": "customer-number",
+      "category": "Customer",
+      "expected": {"status": "completed", "tool": "customer_query", "parameters": {"customer_no": "CUS-DEMO-001"}},
+      "observed": {"status": "completed", "tool": "customer_query", "parameters": {"customer_no": "CUS-DEMO-002"}, "latencyMs": 102, "tokenUsage": 19}
+    },
+    {
+      "id": "metrics-sales",
+      "category": "Metrics",
+      "expected": {"status": "completed", "tool": "metrics_query", "parameters": {"metric": "sales_amount"}},
+      "observed": {"status": "completed", "tool": "metrics_query", "parameters": {"metric": "sales_amount"}, "latencyMs": 140, "tokenUsage": 22}
+    },
+    {
+      "id": "database-readonly",
+      "category": "Database",
+      "expected": {"status": "completed", "tool": "database_agent", "parameters": {}, "sqlExecuted": true},
+      "observed": {"status": "completed", "tool": "database_agent", "parameters": {}, "sqlExecuted": true, "latencyMs": 260, "tokenUsage": 35}
+    },
+    {
+      "id": "action-followup",
+      "category": "Action",
+      "expected": {"status": "completed", "tool": "task_create", "parameters": {"order_no": "ORD-DEMO-001"}},
+      "observed": {"status": "completed", "tool": "task_create", "parameters": {"order_no": "ORD-DEMO-001"}, "latencyMs": 130, "tokenUsage": 20}
+    },
+    {
+      "id": "hitl-cancel-request",
+      "category": "HITL",
+      "expected": {"status": "completed", "tool": "task_cancel_request", "parameters": {"target_task_id": "demo-target"}, "constraints": {"approvalStatus": "pending", "sideEffectBeforeApproval": false}},
+      "observed": {"status": "completed", "tool": "task_cancel_request", "parameters": {"target_task_id": "demo-target"}, "approvalStatus": "pending", "sideEffectBeforeApproval": false, "latencyMs": 150, "tokenUsage": 21}
+    }
+  ]
+}

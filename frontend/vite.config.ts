@@ -9,7 +9,6 @@ export default defineConfig({
     proxy: {
       '/api': 'http://127.0.0.1:8100',
       '/ws': { target: 'ws://127.0.0.1:8100', ws: true },
-      '/knowledge': 'http://127.0.0.1:8100',
       '/metrics': 'http://127.0.0.1:8100'
     }
   }

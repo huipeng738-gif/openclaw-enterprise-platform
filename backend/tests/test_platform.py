@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from datetime import datetime, timezone
 
 import fakeredis.aioredis
 from fastapi.testclient import TestClient
@@ -13,6 +14,48 @@ import base64
 
 os.environ['JWT_SECRET'] = 'test-secret-' * 4
 from app import main, worker  # noqa: E402
+
+
+# 验证仅元数据变化不会再次发送相同状态，避免执行时间线重复。
+def test_worker_metadata_update_does_not_duplicate_status(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(worker, 'r', fake)
+
+    async def scenario():
+        await fake.set('task:status-event', json.dumps({
+            'id': 'status-event', 'status': 'queued', 'createdAt': datetime.now(timezone.utc).isoformat(),
+        }))
+        await worker.update('status-event', status='running')
+        await worker.update('status-event', runId='gateway-run')
+        events = [json.loads(fields['data']) for _, fields in await fake.xrange('events:status-event')]
+        assert [(event['kind'], event['status']) for event in events] == [('status', 'running')]
+
+    asyncio.run(scenario())
+
+
+def test_dashboard_uses_visible_real_tasks(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(main, 'r', fake)
+    today = datetime.now(timezone.utc).isoformat()
+    async def seed():
+        await fake.hset('user:alice', mapping={'password': main.password_hash('strongpassword123'), 'role': 'operator'})
+        for task_id, owner, status in [('a', 'alice', 'completed'), ('b', 'alice', 'failed'), ('c', 'bob', 'completed')]:
+            await fake.set(f'task:{task_id}', json.dumps({'id': task_id, 'owner': owner, 'status': status,
+                                                         'createdAt': today, 'prompt': task_id, 'agent': 'coordinator'}))
+            await fake.sadd('tasks:all', task_id)
+    asyncio.run(seed())
+    with TestClient(main.app) as client:
+        token = client.post('/api/auth/login', json={'username': 'alice', 'password': 'strongpassword123'}).json()['access_token']
+        response = client.get('/api/dashboard', headers={'Authorization': 'Bearer ' + token})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['todayTasks'] == 2
+        assert data['successRate'] == 50.0
+        assert {task['id'] for task in data['recentTasks']} == {'a', 'b'}
+        assert [task['id'] for task in data['failedTasks']] == ['b']
+        assert data['gateway']['status'] == 'unknown'
+        assert client.get('/api/runtime/gateway').status_code == 401
+        assert client.get('/api/runtime/gateway', headers={'Authorization': 'Bearer ' + token}).json()['status'] == 'unknown'
 
 
 def test_login_rbac_owner_retry_and_audit(monkeypatch):
