@@ -17,12 +17,24 @@ import Settings from '../views/Settings.vue'
 const router = createRouter({
     history: createWebHistory(), routes: [
         {path: '/login', component: Login},
-        {path: '/', alias: '/dashboard', component: Dashboard}, {path: '/chat', component: Chat, meta: {roles: ['operator', 'admin']}},
-        {path: '/agents', component: Agents}, {path: '/knowledge', component: Knowledge, meta: {roles: ['operator', 'admin']}},
+        {path: '/', alias: '/dashboard', component: Dashboard}, {
+            path: '/chat',
+            component: Chat,
+            meta: {roles: ['operator', 'admin']}
+        },
+        {path: '/agents', component: Agents}, {
+            path: '/knowledge',
+            component: Knowledge,
+            meta: {roles: ['operator', 'admin']}
+        },
         {path: '/analytics', component: Analytics, meta: {roles: ['operator', 'admin']}},
         {path: '/orders', component: Orders, meta: {roles: ['operator', 'admin']}},
         {path: '/customers', component: Customers, meta: {roles: ['operator', 'admin']}},
-        {path: '/tasks', component: Tasks}, {path: '/approvals', component: Approvals, meta: {roles: ['operator', 'admin']}},
+        {path: '/tasks', component: Tasks}, {
+            path: '/approvals',
+            component: Approvals,
+            meta: {roles: ['operator', 'admin']}
+        },
         {path: '/audit', component: Audit, meta: {admin: true}},
         {path: '/monitor', component: Monitor, meta: {admin: true}},
         {path: '/settings', component: Settings, meta: {admin: true}}

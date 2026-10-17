@@ -45,25 +45,49 @@ ROLES = {'viewer': {'tasks:read', 'agents:read'},
 TERMINAL = {'completed', 'failed', 'cancelled', 'timed_out'}
 
 
-# 启动时检查 Redis 与业务 MySQL，创建 RAGFlow 客户端，退出时释放连接。
+# 使用异步上下文管理器管理 FastAPI 生命周期
 @asynccontextmanager
 async def lifespan(app):
+    # 1. 检查 Redis 是否可以连接
     await r.ping()
+
+    # 2. 创建 MySQL 业务数据库连接池
+    # 并保存到 FastAPI 应用状态中
     app.state.business_db = await BusinessDatabase.from_env()
+
+    # 3. 判断 users 对象是否已经存在
     if getattr(app.state, 'users', None) is None:
+
+        # 4. MySQL 不可用则禁止应用启动
         if app.state.business_db is None:
             raise RuntimeError('MySQL account store is required')
+
+        # 5. 创建用户管理对象，传入 MySQL 连接池
         app.state.users = UserStore(app.state.business_db.pool)
+
+        # 6. 检查 MySQL 用户表结构是否存在
         await app.state.users.ensure_schema()
+
+        # 7. 将旧版 Redis 用户数据迁移到 MySQL
         await migrate_legacy_users(r, app.state.users)
+
+    # 8. 创建 RAGFlow 客户端
     app.state.ragflow = RagflowClient.from_env()
+
     try:
+        # 9. 启动初始化完成，应用开始提供服务
         yield
+
     finally:
+        # 10. 应用关闭时，释放 RAGFlow 客户端
         if app.state.ragflow:
             await app.state.ragflow.close()
+
+        # 11. 关闭 MySQL 连接池
         if app.state.business_db:
             await app.state.business_db.close()
+
+        # 12. 关闭 Redis 客户端连接
         await r.aclose()
 
 
@@ -130,16 +154,35 @@ class DatabaseQuestion(BaseModel):
 
 # 使用随机盐和 PBKDF2 生成密码摘要，返回盐与摘要的组合。
 def password_hash(password, salt=None):
+    # 1. 如果没有传入盐值，就生成一个新的随机盐
     salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 600_000)
+
+    # 2. 使用 PBKDF2-HMAC-SHA256 计算密码摘要
+    digest = hashlib.pbkdf2_hmac(
+        'sha256',  # 哈希算法
+        password.encode(),  # 明文密码转换为 UTF-8 字节
+        bytes.fromhex(salt),  # 将十六进制盐值转换为字节
+        600_000  # 迭代次数：60 万次
+    )
+
+    # 3. 将盐值和摘要拼接后返回
     return f'{salt}${digest.hex()}'
 
 
 # 使用存储的盐校验密码，以恒定时间比较摘要；格式异常时返回 False。
 def password_valid(password, stored):
     try:
+        # 1. 从数据库保存的 salt$hash 中提取 Salt
         salt, _ = stored.split('$', 1)
-        return hmac.compare_digest(password_hash(password, salt), stored)
+
+        # 2. 使用原 Salt 对用户输入的密码重新计算摘要
+        # 3. 比较新摘要与数据库摘要是否一致
+        return hmac.compare_digest(
+            password_hash(password, salt),
+            stored
+        )
+
+    # 4. 数据格式或类型异常时，返回密码校验失败
     except (ValueError, TypeError):
         return False
 
@@ -210,49 +253,177 @@ async def runtime_gateway(user=Depends(permission('tasks:read'))):
     return await gateway_status(r)
 
 
+# 注册 POST 登录接口，访问地址为 /api/auth/login。
+# 用户提交用户名和密码后，FastAPI 自动将请求体解析为 Login 对象。
+# request 用于获取当前请求信息、应用状态和 Cookie；
+# response 用于设置响应头以及向浏览器写入 Cookie。
 @app.post('/api/auth/login')
 async def login(body: Login, request: Request, response: Response):
+    # 检查请求来源是否合法，防止不可信站点利用浏览器 Cookie 发起跨站请求。
+    # 如果来源不符合安全策略，通常会直接拒绝请求。
     cookie_origin_guard(request)
+
+    # 设置 HTTP 响应头，禁止浏览器和中间缓存存储登录响应。
+    # 避免 Access Token 等敏感登录信息被缓存。
     response.headers['Cache-Control'] = 'no-store'
-    # Bound repeated password guesses without writing credentials to the audit stream.
+
+    # 根据用户名生成 Redis Key，例如 login-attempts:admin。
+    # 每次登录请求通过 INCR 将计数加 1。
+    # 第一次请求设置 60 秒过期时间，后续请求不会重置该时间。
+    # 如果在 60 秒内超过 10 次登录请求，就返回 HTTP 429，限制频繁尝试密码。
+    # Redis Key 到期后自动删除，计数重新开始。
+    # 注意：这里统计的是登录请求次数，而不仅仅是密码错误次数。
     attempts = await r.incr(f'login-attempts:{body.username[:80]}')
     if attempts == 1:
         await r.expire(f'login-attempts:{body.username[:80]}', 60)
     if attempts > 10:
         raise HTTPException(429, 'too many login attempts; try again later')
+
+    # 根据用户提交的用户名，从用户存储中查询用户信息。
+    # request.app.state.users 是应用启动时挂载的用户存储对象，
+    # get() 返回用户记录，通常包含密码哈希、角色、禁用状态和会话版本等信息。
     user = await request.app.state.users.get(body.username)
+
+    # 验证三个条件：
+    # 1. 用户是否存在；
+    # 2. 用户输入的密码是否与数据库保存的密码哈希匹配；
+    # 3. 用户账号是否被禁用。
+    # 只要任意条件不满足，就记录登录失败审计日志，并返回 HTTP 401。
+    # 统一返回 invalid credentials，避免暴露具体是用户名错误还是密码错误。
+    # password_valid() 用于验证密码，不需要保存或比较明文密码。
     if not user or not password_valid(body.password, user['password_hash']) or user['disabled']:
         await audit(body.username[:80], 'auth.login', '-', 'denied')
         raise HTTPException(401, 'invalid credentials')
+
+    # 用户验证通过后，记录登录成功的审计日志。
+    # auth.login 表示登录操作，默认结果由 audit() 的实现决定。
     await audit(body.username, 'auth.login', '-')
+
+    # 登录成功后，删除 Redis 中当前用户的登录尝试次数。
+    # 这样用户下一次登录时，计数会重新从 1 开始。
     await r.delete(f'login-attempts:{body.username[:80]}')
+
+    # 获取当前 UTC 时间，作为 Token 的签发时间和会话创建时间。
     now = datetime.now(timezone.utc)
+
+    # 计算 Refresh Token 的过期时间。
+    # REFRESH_TOKEN_EXPIRE_DAYS 是配置的有效天数。
+    # 例如配置为 7，则 Refresh Token 在签发 7 天后过期。
     expires = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+    # 生成随机且唯一的 Token ID（jti）。
+    # jti 用于标识一次 Refresh Token 会话，
+    # 方便在 Redis 中查找、撤销和管理该会话。
     jti = uuid.uuid4().hex
+
+    # 将 Refresh Token 对应的会话信息保存到 Redis。
+    # Redis Key 格式为 auth:refresh:唯一jti。
+    # username 表示当前登录用户；
+    # created_at 表示会话创建时间；
+    # expires_at 表示会话过期时间。
+    # ex 设置 Redis Key 的有效期，单位为秒。
+    # 这样 Refresh Token 到期后，对应的 Redis 会话也会自动过期。
+    # Redis 保存会话记录，可以让服务端主动撤销 Refresh Token，
+    # 而不只是依赖 JWT 自身的过期时间。
     await r.set(f'auth:refresh:{jti}', json.dumps({
-        'username': body.username, 'created_at': now.isoformat(), 'expires_at': expires.isoformat()
+        'username': body.username,
+        'created_at': now.isoformat(),
+        'expires_at': expires.isoformat()
     }), ex=REFRESH_TOKEN_EXPIRE_DAYS * 86400)
-    refresh_token = jwt.encode({'sub': body.username, 'iss': 'enterprise-bff', 'type': 'refresh',
-                               'jti': jti, 'sessionVersion': user['session_version'],
-                               'iat': now, 'exp': expires}, SECRET, algorithm='HS256')
-    # Re-login replaces the current browser session rather than leaving it usable.
+
+    # 使用 JWT 生成 Refresh Token。
+    # sub：当前用户的用户名；
+    # iss：Token 签发者，这里是 enterprise-bff；
+    # type：Token 类型，标记为 refresh；
+    # jti：当前 Refresh Token 对应的唯一会话 ID；
+    # sessionVersion：用户会话版本，可用于配合服务端校验实现会话失效；
+    # iat：Token 签发时间；
+    # exp：Token 过期时间。
+    # SECRET 是服务端的 JWT 签名密钥。
+    # HS256 是对称签名算法，用于保证 Token 内容没有被非法篡改。
+    # JWT 是经过签名的凭证，并不是对载荷内容进行加密。
+    refresh_token = jwt.encode({
+        'sub': body.username,
+        'iss': 'enterprise-bff',
+        'type': 'refresh',
+        'jti': jti,
+        'sessionVersion': user['session_version'],
+        'iat': now,
+        'exp': expires
+    }, SECRET, algorithm='HS256')
+
+    # 从当前浏览器请求的 Cookie 中读取旧 Refresh Token。
+    # REFRESH_COOKIE 是 Refresh Token 对应的 Cookie 名称。
+    # refresh_claims() 用于解析和校验旧 Token，
+    # 如果校验失败，则通常返回空值。
     old = refresh_claims(request.cookies.get(REFRESH_COOKIE, ''))
+
+    # 如果浏览器携带有效的旧 Refresh Token，
+    # 就根据旧 Token 的 jti 删除对应 Redis 会话。
+    # 这样当前浏览器重新登录后，旧 Refresh Token 将无法继续刷新 Access Token。
+    # 注意：这不会自动使所有旧 Access Token 立即失效。
     if old:
         await r.delete(f'auth:refresh:{old["jti"]}')
-    response.set_cookie(REFRESH_COOKIE, refresh_token, httponly=True, secure=REFRESH_COOKIE_SECURE,
-                        samesite='lax', path=REFRESH_COOKIE_PATH,
-                        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, expires=expires)
-    return access_response(body.username, user['role'], user['session_version'])
+
+    # 将新生成的 Refresh Token 写入浏览器 Cookie。
+    #
+    # REFRESH_COOKIE：Cookie 名称。
+    # refresh_token：Cookie 保存的 Refresh Token。
+    # httponly=True：禁止前端 JavaScript 读取 Cookie，降低 Token 被 XSS 窃取的风险。
+    # secure=REFRESH_COOKIE_SECURE：配置为 True 时，仅通过 HTTPS 发送 Cookie。
+    # samesite='lax'：限制部分跨站请求携带 Cookie，降低 CSRF 风险。
+    # path=REFRESH_COOKIE_PATH：限制 Cookie 在指定路径下发送。
+    # max_age：Cookie 的最大有效时长，单位为秒。
+    # expires：Cookie 的绝对过期时间。
+    # 浏览器会在符合 Cookie 安全策略的后续请求中自动携带它。
+    response.set_cookie(
+        REFRESH_COOKIE,
+        refresh_token,
+        httponly=True,
+        secure=REFRESH_COOKIE_SECURE,
+        samesite='lax',
+        path=REFRESH_COOKIE_PATH,
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        expires=expires
+    )
+
+    # 登录成功后，调用 access_response() 生成登录响应。
+    # 传入用户名、角色和会话版本。
+    # 通常该函数负责生成 Access Token，并返回前端需要的登录信息，
+    # 具体返回内容取决于 access_response() 的实际实现。
+    # 前端可使用 Access Token 访问需要身份认证的业务接口。
+    return access_response(
+        body.username,
+        user['role'],
+        user['session_version']
+    )
 
 
 def cookie_origin_guard(request: Request):
-    # Same-origin deployment through Vite/Nginx; reject cross-origin cookie mutations.
+    # 同源部署（Vite/Nginx），拒绝跨源 Cookie 认证相关操作
+
+    # 1. 获取请求头中的 Origin
     origin = request.headers.get('origin')
-    expected = os.getenv('AUTH_ORIGIN', '').rstrip('/') or f'{request.url.scheme}://{request.headers.get("host", "")}'
+
+    # 2. 获取允许的来源地址
+    expected = (
+            os.getenv('AUTH_ORIGIN', '').rstrip('/')
+            or f'{request.url.scheme}://{request.headers.get("host", "")}'
+    )
+
+    # 3. 校验 Origin 是否符合预期
     if origin and origin.rstrip('/') != expected:
-        raise HTTPException(403, 'cross-origin authentication request denied')
+        raise HTTPException(
+            403,
+            'cross-origin authentication request denied'
+        )
+
+    # 4. 检查请求是否属于跨站请求
     if request.headers.get('sec-fetch-site') == 'cross-site':
-        raise HTTPException(403, 'cross-site authentication request denied')
+        raise HTTPException(
+            403,
+            'cross-site authentication request denied'
+        )
 
 
 def refresh_claims(token: str):
@@ -437,8 +608,10 @@ async def dashboard(user=Depends(permission('tasks:read'))):
     terminal = [t for t in visible if t['status'] in TERMINAL]
     completed = sum(t['status'] == 'completed' for t in terminal)
     recent = sorted(visible, key=lambda t: t.get('createdAt', ''), reverse=True)
+
     def summary(task):
         return {key: task.get(key) for key in ('id', 'prompt', 'agent', 'status', 'createdAt', 'latencyMs')}
+
     observability = await summarize_observability(r, recent)
     trend = []
     for days_ago in range(6, -1, -1):
@@ -459,6 +632,7 @@ async def enqueue(body, user, kind='chat'):
     if kind != 'database' and body.agent not in await enabled_ids(r):
         raise HTTPException(400, 'agent not allowed')
     task_id = uuid.uuid4().hex
+
     # 任务策略与入队使用 WATCH/MULTI 建立顺序；Worker 使用快照中的有效超时。
     def task_factory(policy):
         return {'id': task_id, 'owner': user['username'], 'prompt': body.prompt, 'agent': body.agent,
@@ -466,6 +640,7 @@ async def enqueue(body, user, kind='chat'):
                 'status': 'queued', 'createdAt': datetime.now(timezone.utc).isoformat(),
                 'result': None, 'error': None, 'traceId': uuid.uuid4().hex,
                 'threadId': None, 'model': None, 'tokenUsage': None}
+
     task = await admit_task(r, task_id, task_factory)
     if task is None:
         raise HTTPException(503, 'new task submissions are paused')

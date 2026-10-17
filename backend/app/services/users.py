@@ -14,10 +14,18 @@ class UserStore:
 
     # 读取单个账号供认证及 Worker 权限复核，不输出密码字段给前端。
     async def get(self, username):
+        # 1. 从 MySQL 连接池获取一个数据库连接
         async with self.pool.acquire() as conn:
+            # 2. 创建游标，查询结果以字典形式返回
             async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute('SELECT username, password_hash, role, disabled, session_version '
-                                     'FROM platform_users WHERE username=%s', (username,))
+                # 3. 执行参数化 SQL，根据用户名查询账号
+                await cursor.execute(
+                    'SELECT username, password_hash, role, disabled, session_version '
+                    'FROM platform_users WHERE username=%s',
+                    (username,)
+                )
+
+                # 4. 获取一条查询结果并返回
                 return await cursor.fetchone()
 
     # 仅列出设置页面需要的非敏感账号字段。
